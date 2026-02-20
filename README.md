@@ -28,7 +28,9 @@ and export it as one cinematic video.
 
 <p align="center">
   <img width="300" src="https://github.com/user-attachments/assets/45ea456f-ed48-477f-bf5e-a0e1f2258d9a" />
+  &nbsp;&nbsp;&nbsp;
   <img width="300" src="https://github.com/user-attachments/assets/86c994b4-a16c-4274-8b42-ced356dff4a1" />
+  &nbsp;&nbsp;&nbsp;
   <img width="300" src="https://github.com/user-attachments/assets/ece2e494-0cf8-4421-99b4-d6dec952a40f" />
 </p>
 
