@@ -7,8 +7,6 @@ cut between angles like a film director —
 and export it as one cinematic video.
 
 ---
-
-## 🇯🇵
 複数のiPhoneで同期撮影し、映画のようにアングルを切り替えて編集、一本の映像として書き出す。
 ポケットの中で実現する、マルチカメラ映画制作システム。
 
@@ -23,6 +21,11 @@ and export it as one cinematic video.
 - Single unified video export  
 
 ---
+・複数デバイスを同期撮影
+・マスター操作で一括録画コントロール
+・接続状況をリアルタイム表示
+・撮影後、各ディバイスの録画データを転送
+・タイムラインに並べてマルチアングル編集し、書き出し。
 
 ## Screenshots
 
