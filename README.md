@@ -30,9 +30,9 @@ and export it as one cinematic video.
 ## Screenshots
 
 <p align="center">
-  <img width="300" src="https://github.com/user-attachments/assets/45ea456f-ed48-477f-bf5e-a0e1f2258d9a" />
+  <img width="300" src="https://github.com/user-attachments/assets/58c11e10-be43-4337-a6e5-66f16414e2d3" />
   &nbsp;&nbsp;&nbsp;
-  <img width="300" src="https://github.com/user-attachments/assets/86c994b4-a16c-4274-8b42-ced356dff4a1" />
+  <img width="300" src="https://github.com/user-attachments/assets/606fdf25-2d0a-4741-b14c-f43a781b3fb6" />
   &nbsp;&nbsp;&nbsp;
   <img width="300" src="https://github.com/user-attachments/assets/ece2e494-0cf8-4421-99b4-d6dec952a40f" />
 </p>
