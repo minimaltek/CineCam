@@ -70,8 +70,8 @@ struct SettingsView: View {
                         .pickerStyle(.menu)
 
                         Picker("画面の向き", selection: $selectedOrientation) {
-                            Text("横向き 📱").tag(VideoOrientation.landscape)
-                            Text("縦向き ⬆️").tag(VideoOrientation.portrait)
+                            Text("横向き").tag(VideoOrientation.landscape)
+                            Text("縦向き").tag(VideoOrientation.portrait)
                         }
                         .pickerStyle(.menu)
                         
@@ -119,6 +119,7 @@ struct SettingsView: View {
     }
 
     private func applySettings() {
+        cameraManager.desiredOrientation = selectedOrientation
         cameraManager.videoOrientation = selectedOrientation.avOrientation
         cameraManager.videoCodec = selectedCodec.avCodec
         print("📹 設定変更: 向き=\(selectedOrientation.rawValue), コーデック=\(selectedCodec.rawValue)")
@@ -144,7 +145,7 @@ enum FrameRate: Int {
     case fps60 = 60
 }
 
-enum VideoOrientation: String {
+enum VideoOrientation: String, Codable {
     case landscape = "横向き"
     case portrait = "縦向き"
     
@@ -184,3 +185,7 @@ enum VideoCodec: String {
     }
 }
 
+#Preview("SettingsView") {
+    SettingsView(cameraManager: .previewMock)
+        .preferredColorScheme(.dark)
+}

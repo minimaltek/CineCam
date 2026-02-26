@@ -33,6 +33,11 @@ class CameraSessionManager: NSObject, ObservableObject {
     // 招待済みピアを記録
     private var invitedPeers: Set<MCPeerID> = []
     
+    // 再接続リトライ用タイマー
+    private var retryWorkItems: [String: DispatchWorkItem] = [:]
+    private let maxRetryCount = 5
+    private var retryCounts: [String: Int] = [:]
+    
     // カメラマネージャー（外部から注入）
     weak var cameraManager: CameraManager?
     
@@ -49,6 +54,8 @@ class CameraSessionManager: NSObject, ObservableObject {
     @Published var previewVideos: [String: URL] = [:]
     /// 全動画が揃いプレビューへ遷移確定〜showPreview = true になるまでのガードフラグ
     private var isTransitioningToPreview = false
+    /// マスターからのannouncementでプレビューが閉じられた場合のフラグ
+    private var pendingMasterAnnouncement = false
     
     // 転送状態管理
     @Published var isTransferring = false
@@ -92,6 +99,13 @@ class CameraSessionManager: NSObject, ObservableObject {
         case connected
     }
     
+    // MARK: - Preview Support
+    
+    /// Canvas / Xcode Preview プロセス内かどうかを判定
+    private static var isPreview: Bool {
+        ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
+    }
+    
     // MARK: - Initialization
     
     override init() {
@@ -101,18 +115,30 @@ class CameraSessionManager: NSObject, ObservableObject {
         self.myPeerID = MCPeerID(displayName: displayName)
         super.init()
         
+        // Canvas Preview では MultipeerConnectivity を起動しない
+        guard !Self.isPreview else { return }
+        
         // セッション作成（暗号化必須）
         session = MCSession(peer: myPeerID,
                            securityIdentity: nil,
                            encryptionPreference: .required)
         session?.delegate = self
+        
+        // ★ アプリ起動時に自動的にAdvertise & Browse開始
+        // メインスレッドで少し遅延させて起動（即座に起動するとクラッシュする可能性があるため）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.startAutoDiscovery()
+        }
     }
     
     // MARK: - Public Methods
     
-    /// 接続開始（マスター/スレーブ未決定）
-    func startConnecting() {
-        isConnecting = true
+    /// 自動Discovery開始（アプリ起動時に自動実行）
+    private func startAutoDiscovery() {
+        guard advertiser == nil, browser == nil else {
+            addLog("Auto-discovery already running")
+            return
+        }
         
         // アドバタイズとブラウズ両方開始
         advertiser = MCNearbyServiceAdvertiser(peer: myPeerID,
@@ -126,65 +152,46 @@ class CameraSessionManager: NSObject, ObservableObject {
         browser?.startBrowsingForPeers()
         
         connectionState = .connecting
-        addLog("🔍 Connecting: \(myPeerID.displayName)")
+        addLog("Auto-discovery started: \(myPeerID.displayName)")
     }
     
-    /// マスター役を選択
+    /// マスター役を選択（自動的に近くのデバイスをスレーブとして接続）
     func selectMasterRole() {
         isMaster = true
         masterPeerID = myPeerID
-        addLog("👑 Selected as Master")
+        addLog("Selected as Master - slaves will auto-connect")
 
-        // role_selected を全ピアに送信。
-        // カメラ起動はここでは行わず、RECボタンを押したとき（startRecordingAll）の
-        // startSession() に完全に委ねる。
-        // 役割選択直後に AVCaptureSession を起動すると MCSession チャンネルの
-        // 確立・維持と競合して切断が起きるため。
+        // 既に接続済みのピアに role_selected を送信
         for peer in connectedPeers {
-            sendRoleSelectedCommand(to: peer)
+            sendMasterAnnouncement(to: peer)
         }
-
-        addLog("📷 Camera startup deferred to REC button press")
+        
+        // 今後接続してくるピアも自動的にスレーブとして扱う
+        addLog("Camera startup deferred to REC button press")
     }
 
-    /// スレーブ役を選択
-    func selectSlaveRole() {
-        isMaster = false
-        addLog("📱 Selected as Slave")
-
-        // カメラはここでは起動しない。
-        // recording_ready を受信したときに初めて起動することで、
-        // MCSession の接続維持と AVCaptureSession 起動の競合を防ぐ。
-        addLog("📱 Camera startup deferred to recording_ready")
-
-        for peer in connectedPeers {
-            sendRoleSelectedCommand(to: peer)
-        }
-    }
-
-    /// role_selected コマンドを特定ピアに送信
-    private func sendRoleSelectedCommand(to peer: MCPeerID) {
-        var command: [String: Any] = ["action": "role_selected"]
-        if isMaster {
-            command["role"] = "master"
-            command["peerID"] = myPeerID.displayName
-        } else {
-            command["role"] = "slave"
-        }
+    /// マスター宣言を特定ピアに送信
+    private func sendMasterAnnouncement(to peer: MCPeerID) {
+        let command: [String: Any] = [
+            "action": "master_announcement",
+            "masterPeerID": myPeerID.displayName
+        ]
         sendCommandTo(peer, command: command)
     }
 
-    /// 接続直後に役割が確定していれば再送する（チャンネル確立を待つため少し遅延）
-    private func scheduleRoleResend(to peer: MCPeerID) {
-        guard masterPeerID != nil else { return }  // 役割未確定なら不要
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+    /// 接続直後にマスターであれば宣言を送る
+    private func announceMasterRoleIfNeeded(to peer: MCPeerID) {
+        guard isMaster, masterPeerID == myPeerID else { return }
+        
+        // チャンネル確立を待つため少し遅延
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self, self.connectedPeers.contains(peer) else { return }
-            self.sendRoleSelectedCommand(to: peer)
-            self.addLog("🔁 Role re-sent to \(peer.displayName) after connect")
+            self.sendMasterAnnouncement(to: peer)
+            self.addLog("Master announcement sent to \(peer.displayName)")
         }
     }
     
-    /// Stopped
+    /// 完全停止（アプリ終了時など）
     func stopHosting() {
         advertiser?.stopAdvertisingPeer()
         browser?.stopBrowsingForPeers()
@@ -198,11 +205,17 @@ class CameraSessionManager: NSObject, ObservableObject {
         isMaster = false
         masterPeerID = nil
 
+        // リトライ関連をクリア
+        retryWorkItems.values.forEach { $0.cancel() }
+        retryWorkItems.removeAll()
+        retryCounts.removeAll()
+
         // 同期録画状態リセット
         isWaitingForReady = false
         readyPeers = []
         pendingSessionID = ""
         pendingTimestamp = 0
+        pendingMasterAnnouncement = false
         
         // セッションを再作成（クリーンな状態にする）
         session = MCSession(peer: myPeerID,
@@ -210,27 +223,141 @@ class CameraSessionManager: NSObject, ObservableObject {
                            encryptionPreference: .required)
         session?.delegate = self
         
-        addLog("🛑 Stopped")
+        addLog("Stopped completely")
     }
 
-    /// プレビューを閉じた後に MCSession をクリーンアップして再接続可能な状態に戻す
-    func cleanupSessionAfterPreview() {
+    /// 接続失敗時に全体を再初期化して再接続を試みる
+    private func scheduleRetryConnection(for peerID: MCPeerID) {
+        let peerName = peerID.displayName
+        let currentCount = (retryCounts[peerName] ?? 0) + 1
+        retryCounts[peerName] = currentCount
+        
+        guard currentCount <= maxRetryCount else {
+            addLog("Retry limit reached for \(peerName)")
+            retryCounts.removeValue(forKey: peerName)
+            return
+        }
+        
+        // 既存のリトライをキャンセル
+        retryWorkItems[peerName]?.cancel()
+        
+        let delay = Double(currentCount) * 1.5  // 1.5秒, 3秒, 4.5秒...
+        addLog("Retry \(currentCount)/\(maxRetryCount) in \(String(format: "%.1f", delay))s")
+        
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            
+            // 既に接続済みならスキップ
+            guard !self.connectedPeers.contains(where: { $0.displayName == peerName }) else {
+                self.retryCounts.removeValue(forKey: peerName)
+                return
+            }
+            
+            // ★ MCSession + advertiser + browser を全部再作成してクリーンな状態にする
+            // （MCSessionの内部ステートマシンが壊れている可能性があるため）
+            self.fullRestart()
+        }
+        
+        retryWorkItems[peerName] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+    
+    /// MCSession + advertiser + browser を完全に再初期化する（接続状態のみリセット、役割は維持）
+    private func fullRestart() {
+        addLog("Full restart: reinitializing session...")
+        
+        // 1. 全部停止
         advertiser?.stopAdvertisingPeer()
         browser?.stopBrowsingForPeers()
         session?.disconnect()
-
-        connectedPeers.removeAll()
-        availablePeers.removeAll()
+        advertiser = nil
+        browser = nil
+        
+        // 接続追跡をクリア（availablePeers, invitedPeersのみ。connectedPeersはMCSessionDelegateが管理）
         invitedPeers.removeAll()
-        connectionState = .disconnected
-        isConnecting = false
-        isMaster = false
-        masterPeerID = nil
+        availablePeers.removeAll()
+        
+        // 2. MCSessionを新規作成
+        session = MCSession(peer: myPeerID,
+                           securityIdentity: nil,
+                           encryptionPreference: .required)
+        session?.delegate = self
+        
+        // 3. advertiser/browserを新規作成＆開始
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            
+            self.advertiser = MCNearbyServiceAdvertiser(peer: self.myPeerID,
+                                                        discoveryInfo: nil,
+                                                        serviceType: self.serviceType)
+            self.advertiser?.delegate = self
+            self.advertiser?.startAdvertisingPeer()
+            
+            self.browser = MCNearbyServiceBrowser(peer: self.myPeerID, serviceType: self.serviceType)
+            self.browser?.delegate = self
+            self.browser?.startBrowsingForPeers()
+            
+            self.addLog("Session restarted – searching...")
+        }
+    }
+    
+    /// 切断後にDiscoveryを再開始（役割選択画面に戻る時に使用）
+    func restartDiscovery() {
+        // まず完全停止
+        stopHosting()
+        
+        // 少し待ってからDiscoveryを再開始
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.startAutoDiscovery()
+        }
+    }
+
+    /// プレビューを強制的に閉じる（マスターからのコマンド受信時用。役割はリセットしない）
+    func dismissPreviewForNextSession() {
+        guard showPreview else { return }
+        
+        // UI状態のみリセット
+        sessionID = ""
         isWaitingForReady = false
         readyPeers = []
         pendingSessionID = ""
         pendingTimestamp = 0
         isTransitioningToPreview = false
+        showPreview = false
+        
+        // カメラ関連のフラグもリセット
+        isCameraReady = false
+        OrientationLock.isCameraActive = false
+        
+        // 録画データをクリア
+        recordedVideos.removeAll()
+        sessionExpectedCounts.removeAll()
+        
+        // ★ 役割はリセットしない（master_announcement / start_camera から呼ばれるため）
+        // cleanupSessionAfterPreview の onDismiss で役割がリセットされないようにフラグを立てる
+        pendingMasterAnnouncement = true
+        addLog("Preview dismissed – preparing for next session")
+    }
+    
+    /// プレビューを閉じた後のクリーンアップ（接続は維持）
+    /// - Returns: trueならマスターだった（roleSelectionScreenに戻す）、falseならスレーブだった（AWAIT維持）
+    @discardableResult
+    func cleanupSessionAfterPreview() -> Bool {
+        // ★ advertiser/browser は停止しない（接続を維持）
+        // ★ session も切断しない
+        // ★ connectedPeers もクリアしない
+        
+        // マスターだったかどうかを先に保存（リセット前に判定するため）
+        let wasMaster = isMaster
+        
+        // UI状態のみリセット
+        sessionID = ""
+        isWaitingForReady = false
+        readyPeers = []
+        pendingSessionID = ""
+        pendingTimestamp = 0
+        isTransitioningToPreview = false
+        showPreview = false
         
         // カメラ関連のフラグもリセット
         isCameraReady = false
@@ -241,13 +368,29 @@ class CameraSessionManager: NSObject, ObservableObject {
         recordedVideos.removeAll()
         sessionExpectedCounts.removeAll()
 
-        // セッションを再作成（クリーンな状態にする）
-        session = MCSession(peer: myPeerID,
-                           securityIdentity: nil,
-                           encryptionPreference: .required)
-        session?.delegate = self
-
-        print("📹 [SessionManager] Session cleaned up after preview")
+        // ★ 役割のリセット
+        // dismissPreviewForNextSessionから呼ばれた場合、既にmasterPeerIDが新しい値にセットされている
+        // ので、リセットしない（pendingMasterAnnouncementフラグで判定）
+        if pendingMasterAnnouncement {
+            // マスターからのannouncementでプレビューが閉じられた → 役割はリセットしない
+            pendingMasterAnnouncement = false
+            addLog("Preview closed – slave role maintained (master=\(masterPeerID?.displayName ?? "nil"))")
+        } else if wasMaster {
+            // マスターがプレビューを閉じた → マスター役のみリセット（roleSelectionScreenに戻す）
+            isMaster = false
+            masterPeerID = nil
+            addLog("Preview closed – master returning to role selection")
+        } else {
+            // スレーブがプレビューを閉じた → スレーブ役は維持（AWAIT画面に戻る）
+            isMaster = false
+            masterPeerID = nil
+            addLog("Preview closed – slave returning to await")
+        }
+        
+        // ★ 接続は維持
+        print("📹 [SessionManager] Cleaned up after preview – connection maintained")
+        
+        return wasMaster
     }
 
     /// Documents/ 内の .mov ファイルをすべて削除する
@@ -274,20 +417,27 @@ class CameraSessionManager: NSObject, ObservableObject {
     /// 特定のピアに接続招待を送る
     func invitePeer(_ peer: MCPeerID) {
         guard let browser = browser,
-              let session = session else { return }
+              let session = session else {
+            addLog("Skip invite: browser or session is nil")
+            return
+        }
         
         // 既にConnectingまたは接続済みの場合はSkip
         if connectedPeers.contains(peer) {
-            addLog("⏭️ Skip: \(peer.displayName) already connected")
+            addLog("Skip: \(peer.displayName) already connected")
             return
         }
+        
+        // MCSessionの状態確認
+        let currentPeers = session.connectedPeers
+        print("📡 [Invite] Session peers before invite: \(currentPeers.map { $0.displayName })")
         
         browser.invitePeer(peer,
                           to: session,
                           withContext: nil,
                           timeout: 30)
         
-        addLog("📤 Inviting: \(peer.displayName)")
+        addLog("Inviting: \(peer.displayName)")
     }
     
     // MARK: - Recording Commands
@@ -295,11 +445,11 @@ class CameraSessionManager: NSObject, ObservableObject {
     /// カメラ起動コマンドを送信（マスターのみ）
     func startCameraForAll() {
         guard isMaster else {
-            addLog("⚠️ Only master can start camera")
+            addLog("Only master can start camera")
             return
         }
         
-        addLog("📷 Starting camera for all devices...")
+        addLog("Starting camera for all devices...")
         
         // カメラ起動待機モードに入る
         isWaitingForCameraReady = true
@@ -325,7 +475,7 @@ class CameraSessionManager: NSObject, ObservableObject {
             if self.connectedPeers.isEmpty {
                 self.isWaitingForCameraReady = false
                 self.isCameraReady = true
-                self.addLog("📷 Camera ready (solo mode)")
+                self.addLog("Camera ready (solo mode)")
                 return
             }
             
@@ -334,14 +484,14 @@ class CameraSessionManager: NSObject, ObservableObject {
                 self.sendCameraStartCommand(to: peer)
             }
             
-            self.addLog("⏳ Waiting for camera_ready from \(self.connectedPeers.count) peer(s)...")
+            self.addLog("Waiting for camera_ready from \(self.connectedPeers.count) peer(s)...")
             
             // タイムアウト: 15秒以内に全員から camera_ready が来なければキャンセル
             DispatchQueue.main.asyncAfter(deadline: .now() + 15.0) { [weak self] in
                 guard let self, self.isWaitingForCameraReady else { return }
                 self.isWaitingForCameraReady = false
                 self.cameraReadyPeers = []
-                self.addLog("⚠️ Camera ready timeout – some peers did not respond")
+                self.addLog("Camera ready timeout – some peers did not respond")
                 // タイムアウトしても続行（応答したピアとだけ録画）
                 self.isCameraReady = true
             }
@@ -350,7 +500,7 @@ class CameraSessionManager: NSObject, ObservableObject {
     
     /// カメラを停止してメニューに戻る
     func stopCameraAndReturnToMenu() {
-        addLog("📷 Stopping camera and returning to menu...")
+        addLog("Stopping camera and returning to menu...")
         
         // カメラ停止時に画面回転の制限を解除
         OrientationLock.isCameraActive = false
@@ -365,17 +515,18 @@ class CameraSessionManager: NSObject, ObservableObject {
             sendCommandToAll(command)
         }
         
-        addLog("✅ Camera stopped")
+        addLog("Camera stopped")
     }
     
-    /// カメラ起動コマンドを送信
+    /// カメラ起動コマンドを送信（向き設定を含む）
     private func sendCameraStartCommand(to peer: MCPeerID) {
         let command: [String: Any] = [
-            "action": "start_camera"
+            "action": "start_camera",
+            "orientation": cameraManager?.desiredOrientation.rawValue ?? "横向き"
         ]
         
         guard let data = try? JSONSerialization.data(withJSONObject: command) else {
-            addLog("❌ Failed to serialize start_camera command")
+            addLog("Failed to serialize start_camera command")
             return
         }
         
@@ -383,9 +534,9 @@ class CameraSessionManager: NSObject, ObservableObject {
         
         do {
             try session.send(data, toPeers: [peer], with: .reliable)
-            addLog("📤 Sent start_camera to \(peer.displayName)")
+            addLog("Sent start_camera to \(peer.displayName)")
         } catch {
-            addLog("❌ Failed to send start_camera: \(error.localizedDescription)")
+            addLog("Failed to send start_camera: \(error.localizedDescription)")
         }
     }
     
@@ -397,13 +548,13 @@ class CameraSessionManager: NSObject, ObservableObject {
         
         isWaitingForCameraReady = false
         isCameraReady = true
-        addLog("✅ All cameras ready! Recording mode enabled.")
+        addLog("All cameras ready! Recording mode enabled.")
     }
     
     /// 全端末でRecording（マスターのみ）― フェーズ1: ready コマンドを送信
     func startRecordingAll() {
         guard isMaster else {
-            addLog("⚠️ Only master can start recording")
+            addLog("Only master can start recording")
             return
         }
 
@@ -423,11 +574,11 @@ class CameraSessionManager: NSObject, ObservableObject {
             sessionID = pendingSessionID
             sessionExpectedCounts[pendingSessionID] = 1  // 自分だけ
             handleStartRecording(timestamp: pendingTimestamp, sessionID: pendingSessionID)
-            addLog("🎬 Solo recording started: SessionID=\(pendingSessionID)")
+            addLog("Solo recording started: SessionID=\(pendingSessionID)")
             return
         }
 
-        addLog("⏳ Ensuring camera ready before sending recording_ready…")
+        addLog("Ensuring camera ready before sending recording_ready…")
 
         // マスター自身のカメラが起動済みであることを確認してから recording_ready を送信
         // （カメラ未起動のまま fire すると、マスター側だけ録画開始が遅れてズレる）
@@ -437,7 +588,7 @@ class CameraSessionManager: NSObject, ObservableObject {
             // （起動に時間がかかってユーザーがキャンセルした場合に誤送信しない）
             guard self.isWaitingForReady,
                   self.pendingSessionID == newSessionID else {
-                self.addLog("⚠️ Camera ready but session already cancelled – skip")
+                self.addLog("Camera ready but session already cancelled – skip")
                 return
             }
             // カメラ起動完了 → recording_ready を全スレーブに送信
@@ -446,7 +597,7 @@ class CameraSessionManager: NSObject, ObservableObject {
                 "sessionID": newSessionID
             ]
             self.sendCommandToAll(command)
-            self.addLog("⏳ Waiting for ready from \(self.connectedPeers.count) peer(s)…")
+            self.addLog("Waiting for ready from \(self.connectedPeers.count) peer(s)…")
 
             // タイムアウト: 10秒以内に全員から ready_ack が来なければキャンセル
             let waitingSessionID = newSessionID
@@ -457,7 +608,7 @@ class CameraSessionManager: NSObject, ObservableObject {
                 self.readyPeers = []
                 self.pendingSessionID = ""
                 self.pendingTimestamp = 0
-                self.addLog("⚠️ Ready timeout – recording cancelled")
+                self.addLog("Ready timeout – recording cancelled")
             }
         }
     }
@@ -475,7 +626,7 @@ class CameraSessionManager: NSObject, ObservableObject {
         // 転送フェーズ中に誰かが切断しても expectedCount が変わらないようにするため。
         let participantCount = connectedPeers.count + 1  // スレーブ全員 + マスター自身
         sessionExpectedCounts[pendingSessionID] = participantCount
-        addLog("📊 Session \(pendingSessionID): \(participantCount)台で録画開始")
+        addLog("Session \(pendingSessionID): \(participantCount)台で録画開始")
 
         let command: [String: Any] = [
             "action": "recording_fire",
@@ -483,7 +634,7 @@ class CameraSessionManager: NSObject, ObservableObject {
             "sessionID": pendingSessionID
         ]
         sendCommandToAll(command)
-        addLog("🔥 Fire! Starting sync recording: SessionID=\(pendingSessionID)")
+        addLog("Fire! Starting sync recording: SessionID=\(pendingSessionID)")
 
         // マスター自身も録画開始
         handleStartRecording(timestamp: pendingTimestamp, sessionID: pendingSessionID)
@@ -492,7 +643,7 @@ class CameraSessionManager: NSObject, ObservableObject {
     /// 全端末でStopped（マスターのみ）
     func stopRecordingAll() {
         guard isMaster else {
-            addLog("⚠️ Only master can stop recording")
+            addLog("Only master can stop recording")
             return
         }
         
@@ -506,7 +657,7 @@ class CameraSessionManager: NSObject, ObservableObject {
         ]
         
         sendCommandToAll(command)
-        addLog("🛑 Recording stopped")
+        addLog("Recording stopped")
         
         // 自分もStopped
         handleStopRecording()
@@ -520,11 +671,11 @@ class CameraSessionManager: NSObject, ObservableObject {
     /// 全ピアにコマンド送信
     private func sendCommandToAll(_ command: [String: Any]) {
         guard let session = session else {
-            addLog("⚠️ No session")
+            addLog("No session")
             return
         }
         guard !connectedPeers.isEmpty else {
-            addLog("⚠️ No peers connected – command '\(command["action"] ?? "")' not sent")
+            addLog("No peers connected – command '\(command["action"] ?? "")' not sent")
             return
         }
 
@@ -533,21 +684,21 @@ class CameraSessionManager: NSObject, ObservableObject {
             // 全ピアへ一括送信を試みる
             do {
                 try session.send(jsonData, toPeers: connectedPeers, with: .reliable)
-                addLog("✅ Command sent: \(command["action"] ?? "")")
+                addLog("Command sent: \(command["action"] ?? "")")
             } catch {
                 // 一括送信失敗時は個別にリトライ（一部ピアが切断状態でも他には届けるため）
-                addLog("⚠️ Bulk send failed (\(error.localizedDescription)) – retrying individually")
+                addLog("Bulk send failed (\(error.localizedDescription)) – retrying individually")
                 for peer in connectedPeers {
                     do {
                         try session.send(jsonData, toPeers: [peer], with: .reliable)
-                        addLog("✅ Command sent to \(peer.displayName): \(command["action"] ?? "")")
+                        addLog("Command sent to \(peer.displayName): \(command["action"] ?? "")")
                     } catch {
-                        addLog("❌ Send to \(peer.displayName) failed: \(error.localizedDescription)")
+                        addLog("Send to \(peer.displayName) failed: \(error.localizedDescription)")
                     }
                 }
             }
         } catch {
-            addLog("❌ Serialize failed: \(error.localizedDescription)")
+            addLog("Serialize failed: \(error.localizedDescription)")
         }
     }
 
@@ -558,7 +709,7 @@ class CameraSessionManager: NSObject, ObservableObject {
             let jsonData = try JSONSerialization.data(withJSONObject: command)
             try session.send(jsonData, toPeers: [peer], with: .reliable)
         } catch {
-            addLog("❌ Send to \(peer.displayName) failed: \(error.localizedDescription)")
+            addLog("Send to \(peer.displayName) failed: \(error.localizedDescription)")
         }
     }
     
@@ -574,7 +725,7 @@ class CameraSessionManager: NSObject, ObservableObject {
                 return
             }
             
-            self.addLog("📥 Received from \(peer.displayName): \(action)")
+            self.addLog("Received from \(peer.displayName): \(action)")
             
             switch action {
             case "start_recording":
@@ -583,13 +734,19 @@ class CameraSessionManager: NSObject, ObservableObject {
                     self.handleStartRecording(timestamp: timestamp, sessionID: sessionID)
                 }
 
+            case "master_announcement":
+                // スレーブ: マスターからの宣言を受信したら自動的にスレーブになる
+                if let masterPeerName = command["masterPeerID"] as? String {
+                    self.handleMasterAnnouncement(masterPeerID: peer, masterPeerName: masterPeerName)
+                }
+
             case "recording_ready":
                 // スレーブ: カメラセッションが起動済みであることを確認してから ready_ack を返す
                 if let sid = command["sessionID"] as? String {
-                    self.addLog("📡 recording_ready received – ensuring camera ready")
+                    self.addLog("recording_ready received – ensuring camera ready")
                     self.cameraManager?.startSession {
                         // startSession は既に起動済みなら即コールバックされる
-                        self.addLog("📷 Camera confirmed ready – sending ready_ack")
+                        self.addLog("Camera confirmed ready – sending ready_ack")
                         let ack: [String: Any] = [
                             "action": "ready_ack",
                             "sessionID": sid,
@@ -603,7 +760,7 @@ class CameraSessionManager: NSObject, ObservableObject {
                 // マスター: スレーブからの準備完了通知を受け取る
                 if let sid = command["sessionID"] as? String, sid == self.pendingSessionID {
                     self.readyPeers.insert(peer)
-                    self.addLog("✅ Ready from \(peer.displayName) (\(self.readyPeers.count)/\(self.connectedPeers.count))")
+                    self.addLog("Ready from \(peer.displayName) (\(self.readyPeers.count)/\(self.connectedPeers.count))")
                     self.fireRecordingIfAllReady()
                 }
 
@@ -611,7 +768,7 @@ class CameraSessionManager: NSObject, ObservableObject {
                 // スレーブ: 録画を一斉開始
                 if let timestamp = command["timestamp"] as? TimeInterval,
                    let sessionID = command["sessionID"] as? String {
-                    self.addLog("🔥 Fire received – starting recording")
+                    self.addLog("Fire received – starting recording")
                     self.handleStartRecording(timestamp: timestamp, sessionID: sessionID)
                 }
 
@@ -620,20 +777,29 @@ class CameraSessionManager: NSObject, ObservableObject {
                 // sessionID が一致する場合のみ処理（古いセッションの誤受信を防ぐ）
                 let incomingSessionID = command["sessionID"] as? String ?? ""
                 if incomingSessionID.isEmpty || incomingSessionID == self.sessionID {
-                    self.addLog("📥 Stop received from \(peer.displayName)")
+                    self.addLog("Stop received from \(peer.displayName)")
                     self.handleStopRecording()
                 } else {
-                    self.addLog("⚠️ stop_recording sessionID mismatch: got \(incomingSessionID), current \(self.sessionID)")
-                }
-                
-            case "role_selected":
-                if let role = command["role"] as? String {
-                    self.handleRoleSelection(role: role, peerID: peer)
+                    self.addLog("stop_recording sessionID mismatch: got \(incomingSessionID), current \(self.sessionID)")
                 }
                 
             case "start_camera":
                 // スレーブ: マスターからのカメラ起動コマンドを受信
-                self.addLog("📥 start_camera received from \(peer.displayName)")
+                self.addLog("start_camera received from \(peer.displayName)")
+                
+                // マスターの向き設定を適用
+                if let orientationRaw = command["orientation"] as? String,
+                   let orientation = VideoOrientation(rawValue: orientationRaw) {
+                    self.cameraManager?.desiredOrientation = orientation
+                    self.addLog("Orientation synced: \(orientationRaw)")
+                }
+                
+                // ★ プレビュー/編集画面を表示中なら閉じる
+                if self.showPreview {
+                    self.addLog("Closing preview – master starting camera")
+                    self.dismissPreviewForNextSession()
+                }
+                
                 // Add delay before starting camera to ensure MCSession channel stability
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     guard let self else { return }
@@ -644,44 +810,52 @@ class CameraSessionManager: NSObject, ObservableObject {
                 // マスター: スレーブからのカメラ準備完了通知を受け取る
                 if let peerName = command["peerName"] as? String {
                     self.cameraReadyPeers.insert(peer)
-                    self.addLog("✅ Camera ready from \(peerName) (\(self.cameraReadyPeers.count)/\(self.connectedPeers.count))")
+                    self.addLog("Camera ready from \(peerName) (\(self.cameraReadyPeers.count)/\(self.connectedPeers.count))")
                     self.checkAllCamerasReady()
                 }
             
             case "stop_camera":
                 // スレーブ: マスターからのカメラ停止コマンドを受信
-                self.addLog("📥 stop_camera received from \(peer.displayName)")
+                self.addLog("stop_camera received from \(peer.displayName)")
                 OrientationLock.isCameraActive = false  // 画面回転制限を解除
                 self.cameraManager?.stopSession()
                 self.isCameraReady = false
                 
             default:
-                self.addLog("⚠️ Unknown command: \(action)")
+                self.addLog("Unknown command: \(action)")
             }
             
         } catch {
-            self.addLog("❌ Parse error: \(error.localizedDescription)")
+            self.addLog("Parse error: \(error.localizedDescription)")
         }
         }
     }
     
-    /// 役割選択処理
-    private func handleRoleSelection(role: String, peerID: MCPeerID) {
-        guard role == "master" else { return }
-        guard masterPeerID != peerID else { return }
-        masterPeerID = peerID
-        addLog("👑 \(peerID.displayName) is master")
-
-        // ⚠️ ここではカメラを起動しない。
-        // AVCaptureSession の startRunning() は内部で大量の XPC 通信を発生させるため、
-        // MCSession のチャンネル確立・維持と競合して切断を引き起こす。
-        // カメラ起動は start_camera コマンドを受信したタイミングまで遅らせる。
-        addLog("📱 Slave role confirmed – camera startup deferred to start_camera")
+    /// マスター宣言の処理（スレーブ側）
+    private func handleMasterAnnouncement(masterPeerID: MCPeerID, masterPeerName: String) {
+        // 既にマスター役を選択済みの場合は無視（衝突防止）
+        guard !isMaster else {
+            addLog("Already master – ignoring announcement from \(masterPeerName)")
+            return
+        }
+        
+        // ★ プレビュー/編集画面を表示中なら閉じる
+        if showPreview {
+            addLog("Closing preview – master announced new session")
+            dismissPreviewForNextSession()
+        }
+        
+        // 自動的にスレーブになる
+        self.masterPeerID = masterPeerID
+        isMaster = false
+        
+        addLog("Auto-assigned as Slave – Master: \(masterPeerName)")
+        addLog("Camera startup deferred to start_camera command")
     }
     
     /// カメラ起動処理（スレーブ用）
     private func handleStartCamera(fromPeer peer: MCPeerID) {
-        addLog("📷 Starting camera for slave...")
+        addLog("Starting camera for slave...")
         
         // カメラ起動時に画面回転を縦固定にする
         OrientationLock.isCameraActive = true
@@ -705,7 +879,7 @@ class CameraSessionManager: NSObject, ObservableObject {
                 "peerName": self.myPeerID.displayName
             ]
             self.sendCommandTo(peer, command: command)
-            self.addLog("📤 Sent camera_ready to \(peer.displayName)")
+            self.addLog("Sent camera_ready to \(peer.displayName)")
         }
     }
     
@@ -720,7 +894,7 @@ class CameraSessionManager: NSObject, ObservableObject {
         // カメラで実際の録画を開始
         cameraManager?.startRecording(timestamp: timestamp, sessionID: sessionID)
         
-        addLog("🎥 Recording: SessionID=\(sessionID)")
+        addLog("Recording: SessionID=\(sessionID)")
     }
     
     /// Stopped処理
@@ -731,7 +905,7 @@ class CameraSessionManager: NSObject, ObservableObject {
         // カメラの録画を停止
         cameraManager?.stopRecording()
         
-        addLog("⏹️ Stopped")
+        addLog("Stopped")
         
         // SessionIDはクリアしない（録画完了コールバックで使用するため）
         print("📹 [SessionManager] Waiting for recording completion callback...")
@@ -751,7 +925,7 @@ class CameraSessionManager: NSObject, ObservableObject {
 
         // ✅ Stop camera when recording ends (transfer continues in background)
         cameraManager?.stopSession()
-        addLog("🛑 Camera stopped – recording completed, starting transfer")
+        addLog("Camera stopped – recording completed, starting transfer")
         
         if let fileSize = try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? UInt64 {
             print("📹 [SessionManager] File size: \(fileSize) bytes")
@@ -761,7 +935,7 @@ class CameraSessionManager: NSObject, ObservableObject {
             print("📹 [SessionManager]   - Peer: \(peer.displayName)")
         }
         
-        addLog("📹 Recording completed: \(videoURL.lastPathComponent)")
+        addLog("Recording completed: \(videoURL.lastPathComponent)")
         
         // Copy own video to Documents (persist)
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -800,7 +974,7 @@ class CameraSessionManager: NSObject, ObservableObject {
             checkAllVideosReceived(sessionID: sessionID)
             
         } catch {
-            let errorMsg = "❌ Copy error: \(error.localizedDescription)"
+            let errorMsg = "Copy error: \(error.localizedDescription)"
             addLog(errorMsg)
             print("❌ [SessionManager] \(errorMsg)")
             print("❌ [SessionManager] Error details: \(error)")
@@ -845,11 +1019,11 @@ class CameraSessionManager: NSObject, ObservableObject {
                                 withName: fileName,
                                 toPeer: peer) { error in
                 if let error = error {
-                    let errorMsg = "❌ Send failed to \(peer.displayName): \(error.localizedDescription)"
+                    let errorMsg = "Send failed to \(peer.displayName): \(error.localizedDescription)"
                     self.addLog(errorMsg)
                     print("❌ [VideoTransfer] \(errorMsg)")
                 } else {
-                    let successMsg = "✅ Sent to \(peer.displayName)"
+                    let successMsg = "Sent to \(peer.displayName)"
                     self.addLog(successMsg)
                     print("✅ [VideoTransfer] \(successMsg)")
                 }
@@ -881,7 +1055,7 @@ class CameraSessionManager: NSObject, ObservableObject {
             }
 
             if videos.count == expectedCount {
-                self.addLog("✅ All videos received for session: \(sessionID)")
+                self.addLog("All videos received for session: \(sessionID)")
 
                 // Transfer complete flag
                 self.isTransferring = false
@@ -915,24 +1089,40 @@ extension CameraSessionManager: MCSessionDelegate {
     /// Peer connection state change
     func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
         DispatchQueue.main.async {
+            print("🔍 [MCSession] State change for \(peerID.displayName): \(state.rawValue)")
+            
             switch state {
             case .connected:
+                print("✅ [MCSession] CONNECTED to \(peerID.displayName)")
                 if !self.connectedPeers.contains(peerID) {
                     self.connectedPeers.append(peerID)
                 }
                 self.connectionState = .connected
-                self.addLog("✅ Connected: \(peerID.displayName)")
-                // MCSession may not complete internal channel establishment immediately after .connected
-                // Wait a bit before resending to prevent "Not in connected state"
-                self.scheduleRoleResend(to: peerID)
+                self.addLog("Connected: \(peerID.displayName)")
+                
+                // リトライカウンタをクリア
+                let peerName = peerID.displayName
+                self.retryCounts.removeValue(forKey: peerName)
+                self.retryWorkItems[peerName]?.cancel()
+                self.retryWorkItems.removeValue(forKey: peerName)
+                
+                // マスターであれば新しく接続したピアに宣言を送る
+                self.announceMasterRoleIfNeeded(to: peerID)
                 
             case .connecting:
+                print("🔄 [MCSession] CONNECTING to \(peerID.displayName)")
                 self.connectionState = .connecting
-                self.addLog("🔄 Connecting: \(peerID.displayName)")
+                self.addLog("Connecting: \(peerID.displayName)")
+                
+                // 接続中になったらリトライをキャンセル
+                let connectingName = peerID.displayName
+                self.retryWorkItems[connectingName]?.cancel()
+                self.retryWorkItems.removeValue(forKey: connectingName)
                 
             case .notConnected:
+                print("❌ [MCSession] NOT CONNECTED to \(peerID.displayName)")
                 self.connectedPeers.removeAll { $0 == peerID }
-                self.addLog("❌ Disconnected: \(peerID.displayName)")
+                self.addLog("Disconnected: \(peerID.displayName)")
 
                 // Don't reset during recording/transfer/waiting/preview transition/preview display
                 // (MultipeerConnectivity may briefly fire notConnected during recording or right after transfer completion)
@@ -944,9 +1134,8 @@ extension CameraSessionManager: MCSessionDelegate {
 
                 if self.connectedPeers.isEmpty && !isActive {
                     self.connectionState = .disconnected
-                    self.isConnecting = false
-                    self.masterPeerID = nil
-                    self.isMaster = false
+                    // ★ 接続が切れてもマスター/スレーブの役割は保持
+                    // （再接続時に役割を維持するため）
                     self.sessionID = ""
                     
                     // カメラ起動状態をリセット
@@ -954,23 +1143,19 @@ extension CameraSessionManager: MCSessionDelegate {
                     self.isCameraReady = false
                     self.cameraReadyPeers.removeAll()
                     
-                    // Reset to avoid duplicate invitations on reconnect
-                    self.invitedPeers.removeAll()
-                    self.addLog("🔄 Session reset")
-
-                    // Stop advertiser/browser once to return to clean state.
-                    // If not stopped, old invitation remnants remain and double invitations easily occur on next connection.
-                    // Also recreate MCSession to clear channel residual state.
-                    self.advertiser?.stopAdvertisingPeer()
-                    self.browser?.stopBrowsingForPeers()
-                    self.session?.disconnect()
-                    self.session = MCSession(peer: self.myPeerID,
-                                            securityIdentity: nil,
-                                            encryptionPreference: .required)
-                    self.session?.delegate = self
+                    self.addLog("Disconnected – maintaining role, will retry connection")
+                } else {
+                    // まだ他のピアが接続されている、または録画中
+                    self.addLog("Still have \(self.connectedPeers.count) peer(s) connected")
+                }
+                
+                // ★ 接続失敗時にセッション再作成＋再招待を試みる（アクティブ時以外）
+                if !isActive {
+                    self.scheduleRetryConnection(for: peerID)
                 }
                 
             @unknown default:
+                print("⚠️ [MCSession] Unknown state for \(peerID.displayName)")
                 break
             }
         }
@@ -988,7 +1173,7 @@ extension CameraSessionManager: MCSessionDelegate {
     
     /// Resource receive started
     func session(_ session: MCSession, didStartReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID, with progress: Progress) {
-        addLog("📥 Receiving: \(resourceName) from \(peerID.displayName)")
+        addLog("Receiving: \(resourceName) from \(peerID.displayName)")
     }
     
     /// Resource receive completed
@@ -999,14 +1184,14 @@ extension CameraSessionManager: MCSessionDelegate {
         print("📹 [VideoReceive] Local URL: \(localURL?.path ?? "nil")")
         
         if let error = error {
-            let errorMsg = "❌ Receive error: \(error.localizedDescription)"
+            let errorMsg = "Receive error: \(error.localizedDescription)"
             addLog(errorMsg)
             print("❌ [VideoReceive] \(errorMsg)")
             return
         }
         
         guard let localURL = localURL else {
-            addLog("❌ No URL received")
+            addLog("No URL received")
             print("❌ [VideoReceive] localURL is nil")
             return
         }
@@ -1023,7 +1208,7 @@ extension CameraSessionManager: MCSessionDelegate {
         let components = fileName.split(separator: "_")
         
         guard components.count >= 2 else {
-            addLog("❌ Invalid filename format: \(resourceName)")
+            addLog("Invalid filename format: \(resourceName)")
             print("❌ [VideoReceive] Invalid filename format")
             return
         }
@@ -1050,7 +1235,7 @@ extension CameraSessionManager: MCSessionDelegate {
             // Copy file
             try FileManager.default.copyItem(at: localURL, to: destinationURL)
             
-            addLog("✅ Received: \(resourceName)")
+            addLog("Received: \(resourceName)")
             print("✅ [VideoReceive] File copied successfully")
             
             // Record received video, update count, check if all received - all on main thread
@@ -1061,7 +1246,7 @@ extension CameraSessionManager: MCSessionDelegate {
                 // (Countermeasure for when stop_recording command wasn't received due to network instability)
                 if self.cameraManager?.isRecording == true && !self.isMaster {
                     print("⚠️ [VideoReceive] Received master video but still recording – force stopping")
-                    self.addLog("⚠️ Force stop: stop_recording was not received in time")
+                    self.addLog("Force stop: stop_recording was not received in time")
                     self.handleStopRecording()
                 }
 
@@ -1082,7 +1267,7 @@ extension CameraSessionManager: MCSessionDelegate {
             }
             
         } catch {
-            let errorMsg = "❌ Save error: \(error.localizedDescription)"
+            let errorMsg = "Save error: \(error.localizedDescription)"
             addLog(errorMsg)
             print("❌ [VideoReceive] \(errorMsg)")
         }
@@ -1097,39 +1282,23 @@ extension CameraSessionManager: MCNearbyServiceAdvertiserDelegate {
     /// When invitation received
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID, withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
         
-        addLog("📨 Invitation from \(peerID.displayName)")
+        addLog("Invitation from \(peerID.displayName)")
         
         // Reject if already connected
         if connectedPeers.contains(peerID) {
-            addLog("⏭️ Rejected: \(peerID.displayName) already connected")
+            addLog("Rejected: \(peerID.displayName) already connected")
             invitationHandler(false, nil)
             return
         }
-
-        // Prevent collision where both devices discover and invite each other simultaneously.
-        // If we already invited the peer, the one with the "smaller" display name in dictionary order
-        // accepts the received invitation, while the "larger" one rejects it and keeps their own invitation.
-        // This ensures only one invitation succeeds.
-        if invitedPeers.contains(peerID) {
-            if myPeerID.displayName < peerID.displayName {
-                // Our name is smaller in dictionary order → accept their invitation, discard ours
-                invitedPeers.remove(peerID)
-                addLog("📨 Bi-directional: accepting \(peerID.displayName)'s invitation")
-            } else {
-                // Our name is larger → reject their invitation and prioritize ours
-                addLog("⏭️ Bi-directional: rejecting \(peerID.displayName)'s invitation")
-                invitationHandler(false, nil)
-                return
-            }
-        }
         
-        // Accept
+        // ★ 名前の辞書順で大きい方だけが招待を送るルールなので、
+        // ここに来る＝相手が招待者（名前が大きい方）。素直に受諾する。
         invitationHandler(true, session)
-        addLog("✅ Accepted: \(peerID.displayName)")
+        addLog("Accepted: \(peerID.displayName)")
     }
     
     func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
-        addLog("❌ Advertise failed: \(error.localizedDescription)")
+        addLog("Advertise failed: \(error.localizedDescription)")
     }
 }
 
@@ -1141,12 +1310,25 @@ extension CameraSessionManager: MCNearbyServiceBrowserDelegate {
         DispatchQueue.main.async {
             if !self.availablePeers.contains(peerID) && peerID != self.myPeerID {
                 self.availablePeers.append(peerID)
-                self.addLog("🔍 Found: \(peerID.displayName)")
+                self.addLog("Found: \(peerID.displayName)")
                 
-                // Invite only if not already invited
+                // ★ 名前の辞書順で大きい方だけが招待を送る（衝突回避）
+                // 小さい方は advertiser 経由で招待を待つ
+                guard self.myPeerID.displayName > peerID.displayName else {
+                    self.addLog("Waiting for invitation from \(peerID.displayName) (lower priority)")
+                    return
+                }
+                
+                // Invite only if not already invited or connected
                 if !self.invitedPeers.contains(peerID) && !self.connectedPeers.contains(peerID) {
                     self.invitedPeers.insert(peerID)
-                    self.invitePeer(peerID)
+                    // ★ 少し遅延を入れて相手のadvertiserが安定してから招待
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        guard let self else { return }
+                        // まだ接続されていなければ招待を送る
+                        guard !self.connectedPeers.contains(peerID) else { return }
+                        self.invitePeer(peerID)
+                    }
                 }
             }
         }
@@ -1156,11 +1338,11 @@ extension CameraSessionManager: MCNearbyServiceBrowserDelegate {
     func browser(_ browser: MCNearbyServiceBrowser, lostPeer peerID: MCPeerID) {
         DispatchQueue.main.async {
             self.availablePeers.removeAll { $0 == peerID }
-            self.addLog("🔍 Peer lost: \(peerID.displayName)")
+            self.addLog("Peer lost: \(peerID.displayName)")
         }
     }
     
     func browser(_ browser: MCNearbyServiceBrowser, didNotStartBrowsingForPeers error: Error) {
-        addLog("❌ Browse failed: \(error.localizedDescription)")
+        addLog("Browse failed: \(error.localizedDescription)")
     }
 }

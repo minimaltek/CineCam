@@ -12,6 +12,19 @@ import Photos
 import Combine
 
 class CameraManager: NSObject, ObservableObject {
+    // MARK: - Preview Support
+    
+    /// プレビュー用のモックインスタンス
+    static var previewMock: CameraManager {
+        let m = CameraManager()
+        // 実機ハード依存の起動は行わず、最低限のダミー状態を用意
+        m.isRecording = false
+        m.recordingDuration = 0
+        m.previewLayer = nil
+        m.currentCamera = nil
+        return m
+    }
+
     // MARK: - Properties
     
     @Published var isRecording = false
@@ -46,6 +59,7 @@ class CameraManager: NSObject, ObservableObject {
     @Published var exposureBias: Float = 0.0  // 露出補正値
     
     // 録画設定
+    @Published var desiredOrientation: VideoOrientation = .landscape
     var videoOrientation: AVCaptureVideoOrientation = .landscapeRight  // デフォルト: 横向き
     @Published var videoCodec: AVVideoCodecType = .hevc  // .h264, .hevc, .proRes422, .proRes4444
     
@@ -83,6 +97,11 @@ class CameraManager: NSObject, ObservableObject {
     /// カメラのセットアップと起動
     func setupCamera() {
         print("🎥 [CameraManager] setupCamera() called")
+        // Preview 環境では実セッションを起動しない
+        if PreviewDetection.isRunningForPreviews {
+            print("🧪 [CameraManager] Running in Preview – skipping camera setup")
+            return
+        }
         checkCameraPermission { [weak self] granted in
             print("🎥 [CameraManager] Permission granted: \(granted)")
             if granted {
@@ -95,8 +114,14 @@ class CameraManager: NSObject, ObservableObject {
         }
     }
     
-    /// セッション起動（録画開始直前に呼ぶ）
+    /// セッション起動(録画開始直前に呼ぶ)
     func startSession(completion: @escaping () -> Void) {
+        // Preview 環境ではセッションを起動しない
+        if PreviewDetection.isRunningForPreviews {
+            print("🧪 [CameraManager] Running in Preview – skipping startSession")
+            completion()
+            return
+        }
         guard let session = captureSession else {
             // まだセットアップされていなければセットアップしてから起動
             checkCameraPermission { [weak self] granted in
@@ -140,6 +165,18 @@ class CameraManager: NSObject, ObservableObject {
     /// キャプチャセッションの設定
     private func configureCaptureSession(thenStart: Bool = false, completion: (() -> Void)? = nil) {
         print("🎥 [CameraManager] configureCaptureSession called, thenStart: \(thenStart)")
+        // Preview 環境では実セッションを構成しない
+        if PreviewDetection.isRunningForPreviews {
+            print("🧪 [CameraManager] Running in Preview – skipping configureCaptureSession")
+            DispatchQueue.main.async {
+                self.captureSession = nil
+                self.videoOutput = nil
+                self.previewLayer = nil
+                self.currentCamera = nil
+                completion?()
+            }
+            return
+        }
         // AVCaptureSession の設定・起動はすべて専用直列キューで行う。
         // global(qos: .userInitiated) を使うと MCSession の内部処理と
         // スレッドプールを奪い合い、startRunning() の長時間ブロック（数秒）が
@@ -189,7 +226,8 @@ class CameraManager: NSObject, ObservableObject {
                     session.addOutput(output)
                     if let connection = output.connection(with: .video),
                        connection.isVideoOrientationSupported {
-                        connection.videoOrientation = self.videoOrientation
+                        // 常にポートレートで録画（クロップは表示・エクスポート時に行う）
+                        connection.videoOrientation = .portrait
                     }
                     print("✅ [CameraManager] Video output added")
                 }
@@ -200,7 +238,8 @@ class CameraManager: NSObject, ObservableObject {
                 let preview = AVCaptureVideoPreviewLayer(session: session)
                 preview.videoGravity = .resizeAspectFill
                 if preview.connection?.isVideoOrientationSupported == true {
-                    preview.connection?.videoOrientation = self.videoOrientation
+                    // プレビューも常にポートレート（端末の物理的な向きに合わせる）
+                    preview.connection?.videoOrientation = .portrait
                 }
 
                 // UI 更新だけメインスレッドへ
@@ -410,6 +449,8 @@ class CameraManager: NSObject, ObservableObject {
     
     /// トーチをトグル
     func toggleTorch() {
+        // Preview 環境ではトーチを操作しない
+        if PreviewDetection.isRunningForPreviews { return }
         sessionQueue.async { [weak self] in
             guard let self, let device = self.currentCamera else { return }
             
@@ -444,6 +485,11 @@ class CameraManager: NSObject, ObservableObject {
     
     /// 録画開始（カメラセッションは常時起動済みを前提とする）
     func startRecording(timestamp: TimeInterval, sessionID: String) {
+        // Preview 環境では録画を行わない
+        if PreviewDetection.isRunningForPreviews {
+            print("🧪 [CameraManager] Running in Preview – skipping startRecording")
+            return
+        }
         print("📹 [CameraManager] ========== START RECORDING ==========")
         print("📹 [CameraManager] SessionID: \(sessionID)")
 
@@ -533,6 +579,12 @@ class CameraManager: NSObject, ObservableObject {
     
     /// カメラセッション停止
     func stopSession() {
+        // Preview 環境では何もしない（UIのクリーンアップのみ）
+        if PreviewDetection.isRunningForPreviews {
+            DispatchQueue.main.async { self.previewLayer = nil }
+            print("🧪 [CameraManager] Running in Preview – skipping stopSession")
+            return
+        }
         sessionQueue.async { [weak self] in
             self?.captureSession?.stopRunning()
             print("🛑 カメラセッション停止")
@@ -634,3 +686,4 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
         print("📹 [CameraManager] ================================================")
     }
 }
+

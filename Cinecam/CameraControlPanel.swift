@@ -69,11 +69,42 @@ struct CameraControlPanel: View {
                 .font(.subheadline)
                 .foregroundColor(.white.opacity(0.7))
             
-            ScrollView(.horizontal, showsIndicators: false) {
+            if PreviewDetection.isRunningForPreviews {
+                // プレビュー時は実デバイス列挙をせず、ダミーUIを表示
                 HStack(spacing: 12) {
-                    // 利用可能なカメラデバイスを取得
-                    ForEach(availableCameras, id: \.uniqueID) { camera in
-                        cameraButton(for: camera)
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.white.opacity(0.08))
+                        .frame(width: 80, height: 80)
+                        .overlay(
+                            VStack(spacing: 8) {
+                                Image(systemName: "camera.viewfinder")
+                                    .font(.title2)
+                                    .foregroundColor(.white.opacity(0.8))
+                                Text("プレビュー")
+                                    .font(.caption2)
+                                    .foregroundColor(.white.opacity(0.8))
+                            }
+                        )
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.white.opacity(0.08))
+                        .frame(width: 80, height: 80)
+                        .overlay(
+                            VStack(spacing: 8) {
+                                Image(systemName: "camera")
+                                    .font(.title2)
+                                    .foregroundColor(.white.opacity(0.8))
+                                Text("ダミー")
+                                    .font(.caption2)
+                                    .foregroundColor(.white.opacity(0.8))
+                            }
+                        )
+                }
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        ForEach(availableCameras, id: \.uniqueID) { camera in
+                            cameraButton(for: camera)
+                        }
                     }
                 }
             }
@@ -238,59 +269,15 @@ struct CameraControlPanel: View {
     // MARK: - Helper Methods
     
     private var availableCameras: [AVCaptureDevice] {
-        var cameras: [AVCaptureDevice] = []
-        
-        // 背面カメラの検出
-        let discoverySession = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [
-                .builtInWideAngleCamera,
-                .builtInTelephotoCamera,
-                .builtInUltraWideCamera,
-                .builtInTripleCamera,
-                .builtInDualCamera,
-                .builtInDualWideCamera
-            ],
-            mediaType: .video,
-            position: .back
-        )
-        
-        cameras.append(contentsOf: discoverySession.devices)
-        
-        return cameras
+        CameraHelper.availableBackCameras()
     }
     
     private func cameraIcon(for deviceType: AVCaptureDevice.DeviceType) -> String {
-        switch deviceType {
-        case .builtInUltraWideCamera:
-            return "circle.hexagonpath"
-        case .builtInWideAngleCamera:
-            return "camera.fill"
-        case .builtInTelephotoCamera:
-            return "camera.aperture"
-        case .builtInTripleCamera, .builtInDualCamera, .builtInDualWideCamera:
-            return "camera.metering.multispot"
-        default:
-            return "camera"
-        }
+        CameraHelper.icon(for: deviceType)
     }
     
     private func cameraLabel(for deviceType: AVCaptureDevice.DeviceType) -> String {
-        switch deviceType {
-        case .builtInUltraWideCamera:
-            return "超広角\n(0.5x)"
-        case .builtInWideAngleCamera:
-            return "広角\n(1x)"
-        case .builtInTelephotoCamera:
-            return "望遠\n(2x)"
-        case .builtInTripleCamera:
-            return "トリプル"
-        case .builtInDualCamera:
-            return "デュアル"
-        case .builtInDualWideCamera:
-            return "デュアル広角"
-        default:
-            return "カメラ"
-        }
+        CameraHelper.label(for: deviceType)
     }
 }
 
@@ -301,7 +288,7 @@ struct CameraControlPanel: View {
         VStack {
             Spacer()
             CameraControlPanel(
-                cameraManager: CameraManager(),
+                cameraManager: .previewMock,
                 isExpanded: .constant(true)
             )
             .padding()

@@ -396,6 +396,8 @@ struct PreviewView: View {
     var onSaveEditState: (([String: [ClipSegment]]) -> Void)? = nil
     /// 保存済みの編集状態（起動時に復元に使う）
     var savedEditState: [String: [SegmentState]] = [:]
+    /// 撮影時の向き設定（クロップ・エクスポートに使用）
+    var desiredOrientation: VideoOrientation = .landscape
 
     @Environment(\.dismiss) private var dismiss
 
@@ -629,7 +631,7 @@ struct PreviewView: View {
 
                 // 書き出しボタン
                 Button {
-                    Task { await exportEngine.export(timeline: timeline, videos: videos) }
+                    Task { await exportEngine.export(timeline: timeline, videos: videos, orientation: desiredOrientation) }
                 } label: {
                     Image(systemName: "square.and.arrow.up")
                         .font(.system(size: 18, weight: .semibold))
@@ -974,7 +976,9 @@ struct PreviewView: View {
         }
         Task {
             if let url = videos[device] {
-                previewAspectRatio = await resolveAspectRatio(for: url)
+                let fileRatio = await resolveAspectRatio(for: url)
+                // desiredOrientation に応じてアスペクト比をオーバーライド
+                previewAspectRatio = desiredOrientation == .landscape ? max(fileRatio, 16.0/9.0) : fileRatio
             }
         }
     }
@@ -1268,7 +1272,9 @@ struct PreviewView: View {
         if let url = videos[selectedDevice] {
             async let ratioTask = resolveAspectRatio(for: url)
             let (_, ratio) = await (thumbsTask, ratioTask)
-            await MainActor.run { previewAspectRatio = ratio }
+            await MainActor.run {
+                previewAspectRatio = desiredOrientation == .landscape ? max(ratio, 16.0/9.0) : ratio
+            }
         } else {
             await thumbsTask
         }

@@ -11,7 +11,8 @@ import SwiftUI
 // AppDelegate から参照するためにグローバルで持つ
 enum OrientationLock {
     static var isRecording = false
-    static var isCameraActive = false  // カメラが起動しているかどうか
+    /// カメラ起動中フラグ（画面回転を縦固定にする）
+    static var isCameraActive = false
 }
 
 class AppDelegate: NSObject, UIApplicationDelegate {
@@ -19,11 +20,6 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         supportedInterfaceOrientationsFor window: UIWindow?
     ) -> UIInterfaceOrientationMask {
-        // カメラ起動中は縦画面固定
-        if OrientationLock.isCameraActive {
-            return .portrait
-        }
-        
         // 録画中は現在の向きに固定（回転を禁止）
         if OrientationLock.isRecording {
             // 現在の画面向きを取得して、その向きだけを許可する
@@ -35,8 +31,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             default:                       return .portrait
             }
         }
-        // 通常時はすべての向きを許可
-        return .allButUpsideDown  // 上下逆さまを除外
+        // カメラ起動中は縦固定
+        if OrientationLock.isCameraActive {
+            return .portrait
+        }
+        // 通常時は全向きを許可
+        return .allButUpsideDown
     }
 }
 

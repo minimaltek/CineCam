@@ -55,6 +55,29 @@ struct CameraOverlayControls: View {
                     .padding(.horizontal, 20)
             }
             
+            // 右上: インカメ切替ボタン
+            VStack {
+                HStack {
+                    Spacer()
+                    Button(action: {
+                        CameraHelper.toggleFrontBackCamera(
+                            currentCamera: cameraManager.currentCamera,
+                            cameraManager: cameraManager
+                        )
+                    }) {
+                        Image(systemName: "arrow.triangle.2.circlepath.camera")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(10)
+                            .background(Color.black.opacity(0.6))
+                            .clipShape(Circle())
+                    }
+                    .padding(.trailing, 20)
+                    .padding(.top, 50)
+                }
+                Spacer()
+            }
+            
             // 録画中の経過時間を画面中央に表示
             if cameraManager.isRecording {
                 centerRecordingTimer
@@ -92,6 +115,29 @@ struct CameraOverlayControls: View {
                 Spacer()
                 recordButton
                     .padding(.bottom, 30)
+            }
+            
+            // 右上: インカメ切替ボタン
+            VStack {
+                HStack {
+                    Spacer()
+                    Button(action: {
+                        CameraHelper.toggleFrontBackCamera(
+                            currentCamera: cameraManager.currentCamera,
+                            cameraManager: cameraManager
+                        )
+                    }) {
+                        Image(systemName: "arrow.triangle.2.circlepath.camera")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(10)
+                            .background(Color.black.opacity(0.6))
+                            .clipShape(Circle())
+                    }
+                    .padding(.trailing, 20)
+                    .padding(.top, 20)
+                }
+                Spacer()
             }
             
             // 録画中の経過時間を画面中央に表示
@@ -401,56 +447,19 @@ struct CameraOverlayControls: View {
     }
     
     private var availableCameras: [AVCaptureDevice] {
-        let discoverySession = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [
-                .builtInUltraWideCamera,
-                .builtInWideAngleCamera,
-                .builtInTelephotoCamera
-            ],
-            mediaType: .video,
-            position: .back
-        )
-        return discoverySession.devices.sorted { lhs, rhs in
-            // 超広角 < 広角 < 望遠 の順
-            let order: [AVCaptureDevice.DeviceType] = [
-                .builtInUltraWideCamera,
-                .builtInWideAngleCamera,
-                .builtInTelephotoCamera
-            ]
-            return (order.firstIndex(of: lhs.deviceType) ?? 0) < (order.firstIndex(of: rhs.deviceType) ?? 0)
-        }
+        CameraHelper.availableBackCameras()
     }
     
     private func cameraZoomLabel(for deviceType: AVCaptureDevice.DeviceType) -> String {
-        switch deviceType {
-        case .builtInUltraWideCamera:
-            return "0.5×"
-        case .builtInWideAngleCamera:
-            return "1×"
-        case .builtInTelephotoCamera:
-            return "2×"
-        default:
-            return "1×"
-        }
+        CameraHelper.zoomLabel(for: deviceType)
     }
     
     private var resolutionText: String {
-        switch cameraManager.videoResolution {
-        case .hd4K3840x2160:
-            return "4K"
-        case .hd1920x1080:
-            return "HD"
-        case .hd1280x720:
-            return "720p"
-        default:
-            return "HD"
-        }
+        cameraManager.videoResolution.displayName
     }
     
     private func formatDuration(_ duration: TimeInterval) -> String {
-        let minutes = Int(duration) / 60
-        let seconds = Int(duration) % 60
-        return String(format: "%02d:%02d:%02d", 0, minutes, seconds)
+        TimeFormatter.formatDuration(duration)
     }
 }
 
@@ -459,7 +468,7 @@ struct CameraOverlayControls: View {
         Color.black.ignoresSafeArea()
         
         CameraOverlayControls(
-            cameraManager: CameraManager(),
+            cameraManager: .previewMock,
             sessionManager: CameraSessionManager()
         )
     }

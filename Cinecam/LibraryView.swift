@@ -69,7 +69,8 @@ struct LibraryView: View {
                 onSaveEditState: { segmentsByDevice in
                     library.saveEditState(id: record.id, segmentsByDevice: segmentsByDevice)
                 },
-                savedEditState: record.editState
+                savedEditState: record.editState,
+                desiredOrientation: VideoOrientation(rawValue: record.desiredOrientation ?? "横向き") ?? .landscape
             )
         }
     }
@@ -183,4 +184,9 @@ struct LibraryView: View {
                 .foregroundColor(.white.opacity(0.4))
         }
     }
+}
+
+#Preview("LibraryView") {
+    LibraryView(library: SessionLibrary.shared)
+        .preferredColorScheme(.dark)
 }

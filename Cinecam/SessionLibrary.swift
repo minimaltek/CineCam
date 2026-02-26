@@ -26,6 +26,8 @@ struct SessionRecord: Identifiable, Codable, Equatable {
     var videoPaths: [String: String]
     /// デバイスごとのセグメント編集状態（保存ボタン押下時に記録）
     var editState: [String: [SegmentState]]
+    /// 撮影時の向き設定（"横向き" or "縦向き"）後方互換のためOptional
+    var desiredOrientation: String?
 
     /// URL に復元した辞書
     /// パスはサンドボックス相対（ファイル名のみ）で保存し、
@@ -45,11 +47,12 @@ struct SessionRecord: Identifiable, Codable, Equatable {
         }
     }
 
-    init(id: String, videos: [String: URL], createdAt: Date = Date()) {
+    init(id: String, videos: [String: URL], createdAt: Date = Date(), orientation: VideoOrientation? = nil) {
         self.id        = id
         self.title     = "UNTITLED"
         self.createdAt = createdAt
         self.editState = [:]
+        self.desiredOrientation = orientation?.rawValue
         // ファイル名のみを保存（サンドボックスパスが変わっても復元できる）
         self.videoPaths = videos.compactMapValues { $0.lastPathComponent }
     }
@@ -62,10 +65,11 @@ struct SessionRecord: Identifiable, Codable, Equatable {
         createdAt  = try c.decode(Date.self,                forKey: .createdAt)
         videoPaths = try c.decode([String: String].self,    forKey: .videoPaths)
         editState  = (try? c.decode([String: [SegmentState]].self, forKey: .editState)) ?? [:]
+        desiredOrientation = try? c.decode(String.self, forKey: .desiredOrientation)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, createdAt, videoPaths, editState
+        case id, title, createdAt, videoPaths, editState, desiredOrientation
     }
 }
 
@@ -84,9 +88,9 @@ final class SessionLibrary: ObservableObject {
     // MARK: - CRUD
 
     /// 新しいセッションを追加（同じ ID が既にあればスキップ）
-    func add(sessionID: String, videos: [String: URL]) {
+    func add(sessionID: String, videos: [String: URL], orientation: VideoOrientation? = nil) {
         guard !records.contains(where: { $0.id == sessionID }) else { return }
-        let record = SessionRecord(id: sessionID, videos: videos)
+        let record = SessionRecord(id: sessionID, videos: videos, orientation: orientation)
         records.insert(record, at: 0)  // 最新が先頭
         save()
     }
