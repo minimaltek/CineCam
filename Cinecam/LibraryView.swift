@@ -74,7 +74,7 @@ struct LibraryView: View {
                             isSelectMode = true
                             selectedIDs.removeAll()
                         } label: {
-                            Image(systemName: "checkmark.circle")
+                            Image(systemName: "trash")
                                 .font(.system(size: 20))
                         }
                         .foregroundColor(.white)

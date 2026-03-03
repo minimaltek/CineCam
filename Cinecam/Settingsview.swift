@@ -7,10 +7,30 @@
 
 import SwiftUI
 import AVFoundation
+import Combine
+
+// MARK: - Purchase Manager
+
+/// 課金状態を管理するシングルトン
+/// 開発中は UserDefaults で管理、リリース時は StoreKit に移行
+class PurchaseManager: ObservableObject {
+    static let shared = PurchaseManager()
+
+    @Published var isPremium: Bool {
+        didSet { UserDefaults.standard.set(isPremium, forKey: "cinecam.isPremium") }
+    }
+
+    init() {
+        isPremium = UserDefaults.standard.bool(forKey: "cinecam.isPremium")
+    }
+}
+
+// MARK: - Settings View
 
 struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
     @ObservedObject var cameraManager: CameraManager
+    @ObservedObject private var purchaseManager = PurchaseManager.shared
 
     @State private var selectedResolution: VideoResolution = .hd1080p
     @State private var selectedFrameRate: FrameRate = .fps30
@@ -92,6 +112,22 @@ struct SettingsView: View {
                         Text(selectedCodec.description)
                             .font(.caption)
                     }
+
+                    #if DEBUG
+                    // ── Developer ──────────────────────────────
+                    Section {
+                        Toggle("Premium Mode", isOn: $purchaseManager.isPremium)
+                            .tint(.cyan)
+                            .listRowBackground(Color.white.opacity(0.08))
+                    } header: {
+                        Text("Developer")
+                    } footer: {
+                        Text(purchaseManager.isPremium
+                             ? "Export without watermark"
+                             : "Export with Cinecam watermark")
+                            .font(.caption)
+                    }
+                    #endif
                 }
                 .scrollContentBackground(.hidden)
             .background(Color.black.ignoresSafeArea())

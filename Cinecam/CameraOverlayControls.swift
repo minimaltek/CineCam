@@ -152,10 +152,6 @@ struct CameraOverlayControls: View {
             
             Spacer()
             
-            if cameraManager.isRecording {
-                recordingTimerBadge
-            }
-            
             guideToggle
             multiMonitorButton
         }
@@ -187,6 +183,7 @@ struct CameraOverlayControls: View {
     
     private var frontBackToggle: some View {
         Button(action: {
+            guard !cameraManager.isRecording else { return }
             CameraHelper.toggleFrontBackCamera(
                 currentCamera: cameraManager.currentCamera,
                 cameraManager: cameraManager
@@ -198,7 +195,9 @@ struct CameraOverlayControls: View {
                 .frame(width: 44, height: 44)
                 .background(Color.black.opacity(0.6))
                 .clipShape(Circle())
+                .opacity(cameraManager.isRecording ? 0.4 : 1.0)
         }
+        .disabled(cameraManager.isRecording)
     }
     
     private var recordingTimerBadge: some View {
@@ -272,26 +271,21 @@ struct CameraOverlayControls: View {
     
     private func lensButton(for camera: AVCaptureDevice) -> some View {
         let isSelected = cameraManager.currentCamera?.uniqueID == camera.uniqueID
-        let isDisabled = cameraManager.isRecording && !isSelected
+        let isDisabled = isSelected || cameraManager.isRecording
         return Button(action: {
-            guard !cameraManager.isRecording else { return }
+            guard !isSelected, !cameraManager.isRecording else { return }
             cameraManager.switchCamera(to: camera)
         }) {
             ZStack {
                 Circle()
-                    .fill(Color.black.opacity(0.6))
+                    .fill(isSelected ? Color.yellow : Color.black.opacity(0.6))
                     .frame(width: 44, height: 44)
-                
-                if isSelected {
-                    Circle()
-                        .stroke(Color.yellow, lineWidth: 2)
-                        .frame(width: 44, height: 44)
-                }
                 
                 Text(CameraHelper.zoomLabel(for: camera.deviceType))
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(isSelected ? .yellow : (isDisabled ? .white.opacity(0.3) : .white))
+                    .foregroundColor(isSelected ? .black : .white)
             }
+            .opacity(isDisabled && !isSelected ? 0.4 : 1.0)
         }
         .disabled(isDisabled)
     }

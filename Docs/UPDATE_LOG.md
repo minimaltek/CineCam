@@ -2,6 +2,43 @@
 
 ---
 
+## 2026-03-03 (v032)
+
+### タイムライン操作改善
+- **スクロール無効化**: タイムライン ScrollView の直接ドラッグスクロールを無効化。ズームバー（シーケンスガイド）のみでスクロール操作
+- **トリムハンドル応答性向上**: DragGesture の minimumDistance を 0→4 に変更し、タップとドラッグを正しく区別
+- **トリムハンドル視覚フィードバック**: ドラッグ中にハンドルが赤く変化（背景赤、シェブロン白）
+- **トリムハンドル拡大対応**: ピンチズーム時に `inverseScaleX` で逆スケールを適用し、ハンドル幅が一定に保たれるよう修正
+- **セグメント選択ラグ修正**: ベースレイヤーの DragGesture を onLongPressGesture に変更し、タップイベントの競合を解消
+- **トリムシーク最適化**: 30ms スロットリング + tolerant seek（0.05s）でドラッグ中のパフォーマンス向上
+
+### レイアウト改善
+- **A:B = 4:6 固定比率**: プレビューエリア（40%）とタイムライン+コントロール（60%）の比率を固定
+- **iPad セーフエリア修正**: UIWindow.safeAreaInsets.top を直接取得し、headerBar の上部パディングを適切に設定
+
+### MultipeerConnectivity 安定化
+- **REBUILD 後の再接続改善**: `browser:foundPeer:` で新しい PeerID を検出した際に stale な接続を即座にクリア
+- **advertiser 側の stale peer 処理**: 異なる PeerID からの招待を受け入れ、古い接続を自動クリーンアップ
+- **軽量リスタート導入**: リトライ 1-2 回目は MCPeerID を維持したまま advertiser/browser のみ再起動（`performLightweightRestart`）
+- **Passive mode タイムアウト**: 10 秒後に自動で active モードに復帰し、Hang 中の相手を待ち続けるデッドロックを防止
+- **outgoing failure 誤カウント修正**: incoming accept の失敗を outgoing failure にカウントしないよう修正
+- **リトライ間隔調整**: Hang 回復を待つため 1.5s→3.0s に延長
+
+### 透かし（ウォーターマーク）機能
+- **PurchaseManager**: UserDefaults ベースの課金状態管理シングルトン
+- **エクスポート時透かし**: CIImage 合成で「Cinecam」テキストを右下に描画（白、opacity 0.6、影付き）
+- **フィルタ+透かし対応**: CIFilter ハンドラー内で transform + フィルタ + 透かしを一括処理
+- **開発用トグル**: Settings 画面に `#if DEBUG` Premium Mode トグル追加
+
+### 変更ファイル
+- `Previewview .swift` — タイムライン操作改善、レイアウト、透かし連携
+- `CameraSessionManager.swift` — MC 安定化（軽量リスタート、stale peer 処理、passive timeout）
+- `CinecamExportEngine.swift` — 透かし描画実装
+- `Settingsview.swift` — PurchaseManager、DEBUG トグル
+- `ContentView.swift` — レイアウト微調整
+
+---
+
 ## 2026-02-28
 
 ### レンズセレクター修正

@@ -71,7 +71,7 @@ struct MultiMonitorView: View {
                     VStack(spacing: 12) {
                         ProgressView()
                             .tint(.white)
-                        Text("スナップショット待機中...")
+                        Text("Waiting for snapshot...")
                             .font(.system(size: 14))
                             .foregroundColor(.gray)
                     }

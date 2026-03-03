@@ -8,6 +8,7 @@ import Foundation
 import Combine
 import AVFoundation
 import CoreImage
+import UIKit
 import Photos
 
 @MainActor
@@ -28,11 +29,11 @@ final class ExportEngine: ObservableObject {
 
     /// 書き出し実行 → カメラロールに保存
     /// - audioSource: nil = 編集に従う（カット毎の音声）、デバイス名 = そのデバイスの音声を全編に使用
-    func export(timeline: ExclusiveEditTimeline, videos: [String: URL], orientation: VideoOrientation = .cinema, audioSource: String? = nil, videoFilter: String? = nil) async {
+    func export(timeline: ExclusiveEditTimeline, videos: [String: URL], orientation: VideoOrientation = .cinema, audioSource: String? = nil, videoFilter: String? = nil, showWatermark: Bool = false) async {
         state = .exporting(progress: 0)
 
         do {
-            let url = try await buildAndExport(timeline: timeline, videos: videos, orientation: orientation, audioSource: audioSource, videoFilter: videoFilter)
+            let url = try await buildAndExport(timeline: timeline, videos: videos, orientation: orientation, audioSource: audioSource, videoFilter: videoFilter, showWatermark: showWatermark)
             // カメラロールに保存（失敗したら .done には絶対到達しない）
             do {
                 try await saveToPhotoLibrary(url: url)
@@ -84,7 +85,8 @@ final class ExportEngine: ObservableObject {
         videos: [String: URL],
         orientation: VideoOrientation = .cinema,
         audioSource: String? = nil,
-        videoFilter: String? = nil
+        videoFilter: String? = nil,
+        showWatermark: Bool = false
     ) async throws -> URL {
 
         // ① 使用するセグメントを trimIn 順に並べる
@@ -141,31 +143,7 @@ final class ExportEngine: ObservableObject {
         var clipRanges: [ClipRange] = []
         var cursor = CMTime.zero
 
-        // 音声ソースが指定されている場合、そのデバイスの音声トラックと長さを事前に取得
-        let audioSourceTrack: AVAssetTrack?
-        let audioSourceDuration: Double  // 音声ソースアセットの長さ（秒）
-        let audioVideoStart: Double      // タイムライン上の開始位置
-        if let audioDevice = audioSource, let audioURL = videos[audioDevice] {
-            let asset = AVURLAsset(url: audioURL)
-            let loadedAudioTracks = try await asset.loadTracks(withMediaType: .audio)
-            audioSourceTrack = loadedAudioTracks.first
-            // 音声トラック自体の長さを使用（動画全体の duration より正確）
-            if let aTrack = audioSourceTrack {
-                let audioTimeRange = try await aTrack.load(.timeRange)
-                audioSourceDuration = CMTimeGetSeconds(audioTimeRange.start + audioTimeRange.duration)
-            } else {
-                audioSourceDuration = CMTimeGetSeconds(try await asset.load(.duration))
-            }
-            audioVideoStart = timeline.videoRangeByDevice[audioDevice]?.start ?? 0
-            #if DEBUG
-            print("🔊 [Export] audioSource=\(audioDevice), audioTracks=\(loadedAudioTracks.count), duration=\(audioSourceDuration)s, videoStart=\(audioVideoStart)s")
-            #endif
-        } else {
-            audioSourceTrack = nil
-            audioSourceDuration = 0
-            audioVideoStart = 0
-        }
-
+        // ③-a 映像クリップを composition に挿入
         for clip in orderedClips {
             let asset = AVURLAsset(url: clip.url)
             let duration = clip.sourceOut - clip.sourceIn
@@ -175,71 +153,62 @@ final class ExportEngine: ObservableObject {
                 try videoTrack.insertTimeRange(timeRange, of: srcVideo, at: cursor)
             }
 
-            if let srcAudioTrack = audioSourceTrack {
-                // 特定デバイスの音声を使用: clip の trimIn を音声ソースのソース時間に変換
-                let audioSrcTime = clip.trimIn - audioVideoStart
-                let durationSec = CMTimeGetSeconds(duration)
-                // 音声ソースの範囲内かチェック
-                let safeStart = max(audioSrcTime, 0)
-                let clampedEnd = min(safeStart + durationSec, max(audioSourceDuration, 0))
-                let clampedDur = max(clampedEnd - safeStart, 0)
-
-                if clampedDur > 0.01 {
-                    let clampedDuration = CMTimeMakeWithSeconds(clampedDur, preferredTimescale: 600)
-                    let audioTimeRange = CMTimeRange(
-                        start: CMTimeMakeWithSeconds(safeStart, preferredTimescale: 600),
-                        duration: clampedDuration
-                    )
-                    do {
-                        try audioTrack.insertTimeRange(audioTimeRange, of: srcAudioTrack, at: cursor)
-                        // クランプで短くなった分を空の時間範囲で穴埋め
-                        let shortfall = duration - clampedDuration
-                        if CMTimeGetSeconds(shortfall) > 0.01 {
-                            audioTrack.insertEmptyTimeRange(CMTimeRange(start: cursor + clampedDuration, duration: shortfall))
-                        }
-                    } catch {
-                        // 挿入失敗 → 無音で埋める
-                        audioTrack.insertEmptyTimeRange(CMTimeRange(start: cursor, duration: duration))
-                        #if DEBUG
-                        print("⚠️ [Export] Audio insert failed at \(safeStart): \(error.localizedDescription)")
-                        #endif
-                    }
-                } else {
-                    // 範囲外: 無音で埋める
-                    audioTrack.insertEmptyTimeRange(CMTimeRange(start: cursor, duration: duration))
-                }
-            } else if let srcAudio = try? await asset.loadTracks(withMediaType: .audio).first {
-                // 編集に従う: 各クリップ自身の音声を使用
-                do {
-                    try audioTrack.insertTimeRange(timeRange, of: srcAudio, at: cursor)
-                } catch {
-                    // 失敗したら無音で埋める
-                    audioTrack.insertEmptyTimeRange(CMTimeRange(start: cursor, duration: duration))
-                }
-            } else {
-                // 音声トラックなし: 無音で埋める
-                audioTrack.insertEmptyTimeRange(CMTimeRange(start: cursor, duration: duration))
-            }
-
             clipRanges.append(ClipRange(compositionStart: cursor, duration: duration, url: clip.url))
             cursor = cursor + duration
         }
 
-        // 音声トラックが空の場合は削除（空トラックがあるとエクスポートが失敗する場合がある）
+        // ③-b 音声トラックを構築
+        let totalCompositionDuration = cursor
+        if let audioDevice = audioSource, let audioURL = videos[audioDevice] {
+            // 特定デバイスの音声を使用: 各クリップの区間に対応する音声を挿入
+            let audioAsset = AVURLAsset(url: audioURL)
+            if let srcAudioTrack = try? await audioAsset.loadTracks(withMediaType: .audio).first {
+                let audioAssetDuration = CMTimeGetSeconds(try await audioAsset.load(.duration))
+                let audioVideoStart = timeline.videoRangeByDevice[audioDevice]?.start ?? 0
+
+                var audioCursor = CMTime.zero
+                for clip in orderedClips {
+                    let clipDur = clip.sourceOut - clip.sourceIn
+                    // clip.trimIn（タイムライン上の絶対位置）を音声ソースファイル内の時間に変換
+                    let audioSrcTime = clip.trimIn - audioVideoStart
+                    let durationSec = CMTimeGetSeconds(clipDur)
+                    let safeStart = max(audioSrcTime, 0)
+                    let clampedEnd = min(safeStart + durationSec, audioAssetDuration)
+                    let clampedDur = max(clampedEnd - safeStart, 0)
+
+                    if clampedDur > 0.01 {
+                        let audioRange = CMTimeRange(
+                            start: CMTimeMakeWithSeconds(safeStart, preferredTimescale: 600),
+                            duration: CMTimeMakeWithSeconds(clampedDur, preferredTimescale: 600)
+                        )
+                        do {
+                            try audioTrack.insertTimeRange(audioRange, of: srcAudioTrack, at: audioCursor)
+                        } catch {
+                            #if DEBUG
+                            print("⚠️ [Export] Audio insert failed at \(safeStart)s: \(error.localizedDescription)")
+                            #endif
+                        }
+                    }
+                    audioCursor = audioCursor + clipDur
+                }
+            }
+        } else {
+            // 編集に従う: 各クリップ自身の音声を使用
+            var audioCursor = CMTime.zero
+            for clip in orderedClips {
+                let asset = AVURLAsset(url: clip.url)
+                let duration = clip.sourceOut - clip.sourceIn
+                let timeRange = CMTimeRange(start: clip.sourceIn, duration: duration)
+                if let srcAudio = try? await asset.loadTracks(withMediaType: .audio).first {
+                    try? audioTrack.insertTimeRange(timeRange, of: srcAudio, at: audioCursor)
+                }
+                audioCursor = audioCursor + duration
+            }
+        }
+
+        // 音声トラックが空なら削除（空トラックがあるとエクスポートが失敗する場合がある）
         if audioTrack.timeRange.duration == .zero {
             composition.removeTrack(audioTrack)
-        } else {
-            // 音声トラックの長さが映像トラックと一致しない場合、
-            // 不足分を空区間で埋める（不一致だと "Operation Stopped" エラーになる）
-            let videoDuration = videoTrack.timeRange.duration
-            let audioDuration = audioTrack.timeRange.duration
-            let gap = videoDuration - audioDuration
-            if CMTimeGetSeconds(gap) > 0.001 {
-                audioTrack.insertEmptyTimeRange(CMTimeRange(start: audioDuration, duration: gap))
-                #if DEBUG
-                print("🔊 [Export] Audio track shorter than video by \(CMTimeGetSeconds(gap))s — padded with silence")
-                #endif
-            }
         }
 
         // ④ Build per-clip video composition instructions
@@ -291,15 +260,19 @@ final class ExportEngine: ObservableObject {
 
         videoComp.instructions = instructions
 
-        // ④-b フィルタ付きの場合は applyingCIFiltersWithHandler で CIFilter を適用
-        // layerInstruction の transform は applyingCIFiltersWithHandler では無視されるため、
-        // ハンドラー内で CIAffineTransform + 選択フィルタを一括適用する
+        // ④-b フィルタ or 透かし付きの場合の処理分岐
+        // applyingCIFiltersWithHandler は animationTool をサポートしないため、
+        // フィルタ使用時は CIImage として透かしを合成する
         let finalVideoComp: AVVideoComposition
-        if let filterName = videoFilter {
-            // クリップごとの transform と時間範囲をキャプチャ用にコピー
+        let needsCIHandler = videoFilter != nil || showWatermark
+
+        if needsCIHandler {
+            // CIFilter ハンドラーで transform + フィルタ + 透かしを一括処理
             let capturedRanges = clipRanges
             let capturedTransforms = transformCache
             let size = renderSize
+            let watermarkImage = showWatermark ? Self.renderWatermarkCIImage(size: size) : nil
+
             finalVideoComp = AVVideoComposition(asset: composition) { request in
                 var image = request.sourceImage.clampedToExtent()
 
@@ -317,11 +290,16 @@ final class ExportEngine: ObservableObject {
                 image = image.cropped(to: CGRect(origin: .zero, size: size))
 
                 // 選択フィルタを適用
-                if let ciFilter = CIFilter(name: filterName) {
+                if let filterName = videoFilter, let ciFilter = CIFilter(name: filterName) {
                     ciFilter.setValue(image, forKey: kCIInputImageKey)
                     if let filtered = ciFilter.outputImage {
                         image = filtered.cropped(to: CGRect(origin: .zero, size: size))
                     }
+                }
+
+                // 透かしを合成
+                if let wm = watermarkImage {
+                    image = wm.composited(over: image)
                 }
 
                 request.finish(with: image, context: nil)
@@ -464,6 +442,49 @@ final class ExportEngine: ObservableObject {
             .concatenating(CGAffineTransform(translationX: tx, y: ty))
 
         return cropTransform
+    }
+
+    // MARK: - Watermark
+
+    /// 透かし用の CIImage を生成（右下に「Cinecam」テキスト）
+    /// renderSize に合わせてフォントサイズを自動調整する
+    private static func renderWatermarkCIImage(size: CGSize) -> CIImage? {
+        let fontSize = max(size.width * 0.035, 20)
+        let margin = size.width * 0.03
+        let text = "Cinecam"
+
+        // UIKit でテキストを描画して CIImage に変換
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: fontSize, weight: .bold),
+            .foregroundColor: UIColor.white.withAlphaComponent(0.6),
+        ]
+        let textSize = (text as NSString).size(withAttributes: attributes)
+
+        // 影付きでテキストを描画
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let uiImage = renderer.image { ctx in
+            // 背景は透明
+            let context = ctx.cgContext
+
+            // 影を設定
+            context.setShadow(
+                offset: CGSize(width: 1, height: -1),
+                blur: 3,
+                color: UIColor.black.withAlphaComponent(0.7).cgColor
+            )
+
+            // テキスト位置（右下、マージン付き）
+            let x = size.width - textSize.width - margin
+            // UIKit 座標系（左上原点）で描画 → CIImage 変換で上下反転 → 右下に表示
+            let drawY = size.height - textSize.height - margin
+            (text as NSString).draw(
+                at: CGPoint(x: x, y: drawY),
+                withAttributes: attributes
+            )
+        }
+
+        guard let cgImage = uiImage.cgImage else { return nil }
+        return CIImage(cgImage: cgImage)
     }
 
     // MARK: - Errors

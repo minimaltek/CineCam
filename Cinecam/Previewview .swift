@@ -6,7 +6,241 @@
 import SwiftUI
 import AVKit
 import AVFoundation
+import AVFAudio
 import Combine
+
+// MARK: - AudioScrubber
+// AVAudioEngine + AVAudioPlayerNode + AVAudioUnitVarispeed で
+// ドラッグ速度に応じたピッチ変化付きスクラブ再生を実現する（レコード/テープ風）
+
+final class AudioScrubber {
+    private var engine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var varispeed: AVAudioUnitVarispeed?
+    private var audioBuffer: AVAudioPCMBuffer?
+    private var audioFormat: AVAudioFormat?
+    private var audioSampleRate: Double = 44100
+    private var audioDuration: Double = 0
+
+    /// 現在ロード中のURL（再ロード防止）
+    private var loadedURL: URL?
+
+    /// スクラブ中かどうか
+    private(set) var isActive = false
+
+    /// 最後にスケジュールした再生位置（秒）
+    private var lastScheduledTime: Double = 0
+    private var lastUpdateCFTime: CFAbsoluteTime = 0
+
+    /// 動画ファイルから音声トラックを PCMバッファに展開する
+    /// AVAudioFile は .mov を開けないため、AVAssetReader で音声トラックを読む
+    func loadAudio(from videoURL: URL) {
+        // 同じファイルならスキップ
+        if loadedURL == videoURL && audioBuffer != nil { return }
+        teardown()
+
+        let asset = AVURLAsset(url: videoURL)
+        guard let audioTrack = asset.tracks(withMediaType: .audio).first else {
+            #if DEBUG
+            print("⚠️ [AudioScrubber] No audio track in: \(videoURL.lastPathComponent)")
+            #endif
+            return
+        }
+
+        // PCM Float32 で読み出す設定
+        let targetSampleRate: Double = 44100
+        let targetChannels: UInt32 = 1  // モノラルで十分（スクラブ用）
+        let outputSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsNonInterleaved: true,
+            AVSampleRateKey: targetSampleRate,
+            AVNumberOfChannelsKey: targetChannels
+        ]
+
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            #if DEBUG
+            print("⚠️ [AudioScrubber] Cannot create AVAssetReader")
+            #endif
+            return
+        }
+
+        let trackOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: outputSettings)
+        trackOutput.alwaysCopiesSampleData = false
+        reader.add(trackOutput)
+
+        guard reader.startReading() else {
+            #if DEBUG
+            print("⚠️ [AudioScrubber] AVAssetReader failed to start: \(reader.error?.localizedDescription ?? "?")")
+            #endif
+            return
+        }
+
+        // 全サンプルをメモリに読み込む
+        var allSamples: [Float] = []
+        allSamples.reserveCapacity(Int(targetSampleRate) * 120) // 最大2分を想定
+        while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
+            guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+            var lengthAtOffset: Int = 0
+            var totalLength: Int = 0
+            var dataPointer: UnsafeMutablePointer<Int8>?
+            let status = CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
+            guard status == noErr, let ptr = dataPointer else { continue }
+            let floatCount = totalLength / MemoryLayout<Float>.size
+            ptr.withMemoryRebound(to: Float.self, capacity: floatCount) { floatPtr in
+                allSamples.append(contentsOf: UnsafeBufferPointer(start: floatPtr, count: floatCount))
+            }
+        }
+
+        guard !allSamples.isEmpty else {
+            #if DEBUG
+            print("⚠️ [AudioScrubber] No audio samples extracted")
+            #endif
+            return
+        }
+
+        // AVAudioPCMBuffer に変換
+        let frameCount = AVAudioFrameCount(allSamples.count)
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: targetSampleRate, channels: targetChannels),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
+        buffer.frameLength = frameCount
+
+        if let channelData = buffer.floatChannelData {
+            allSamples.withUnsafeBufferPointer { src in
+                channelData[0].update(from: src.baseAddress!, count: Int(frameCount))
+            }
+        }
+
+        audioBuffer = buffer
+        audioFormat = format
+        audioSampleRate = targetSampleRate
+        audioDuration = Double(frameCount) / targetSampleRate
+        loadedURL = videoURL
+
+        // Engine セットアップ
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        let vari = AVAudioUnitVarispeed()
+
+        engine.attach(player)
+        engine.attach(vari)
+        engine.connect(player, to: vari, format: format)
+        engine.connect(vari, to: engine.mainMixerNode, format: format)
+
+        self.engine = engine
+        self.playerNode = player
+        self.varispeed = vari
+
+        #if DEBUG
+        print("✅ [AudioScrubber] Loaded \(videoURL.lastPathComponent) — \(String(format: "%.1f", audioDuration))s, \(allSamples.count) samples")
+        #endif
+    }
+
+    /// スクラブ開始
+    func start() {
+        guard let engine, let playerNode else { return }
+        do {
+            if !engine.isRunning {
+                try engine.start()
+            }
+            playerNode.stop()
+            isActive = true
+            lastUpdateCFTime = CFAbsoluteTimeGetCurrent()
+        } catch {
+            #if DEBUG
+            print("⚠️ [AudioScrubber] Engine start failed: \(error)")
+            #endif
+        }
+    }
+
+    /// スクラブ更新: 位置(秒)とドラッグ速度(秒/秒)を渡す
+    /// velocity > 0: 順方向, velocity < 0: 逆方向
+    func update(positionInSource seconds: Double, velocity: Double) {
+        guard isActive,
+              let playerNode,
+              let audioBuffer,
+              let audioFormat else { return }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let dtSinceLastUpdate = now - lastUpdateCFTime
+
+        let absVelocity = abs(velocity)
+        // 速度が非常に小さい場合は無音（指が止まっている）
+        guard absVelocity > 0.05 else {
+            playerNode.stop()
+            lastScheduledTime = seconds
+            return
+        }
+
+        // 前回スケジュールからの予測再生位置（Varispeed rate を加味）
+        let currentRate = Double(varispeed?.rate ?? 1.0)
+        let predictedPos = lastScheduledTime + dtSinceLastUpdate * currentRate
+        let drift = abs(seconds - predictedPos)
+
+        // ドリフトが小さい（0.15秒未満）かつ前回から60ms未満 → 自然再生に任せる（ループ防止）
+        if drift < 0.15 && dtSinceLastUpdate < 0.06 {
+            // rate だけ更新
+            let newRate = Float(min(max(absVelocity, 0.25), 4.0))
+            varispeed?.rate = newRate
+            return
+        }
+
+        lastUpdateCFTime = now
+
+        // Varispeed rate: ドラッグ速度をレートに変換
+        let rate = Float(min(max(absVelocity, 0.25), 4.0))
+        varispeed?.rate = rate
+
+        // 再生位置（フレーム）
+        let clampedSec = max(0, min(seconds, audioDuration - 0.01))
+        let startFrame = AVAudioFramePosition(clampedSec * audioSampleRate)
+
+        // 長めの区間をスケジュール（約200ms分 — 次の update まで再生し続ける）
+        let chunkFrames = AVAudioFrameCount(audioSampleRate * 0.2)
+        let availableFrames = AVAudioFrameCount(audioBuffer.frameLength) - AVAudioFrameCount(startFrame)
+        let framesToPlay = min(chunkFrames, availableFrames)
+        guard framesToPlay > 0 else { return }
+
+        // バッファの部分再生用にセグメントバッファを作成
+        guard let segmentBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: framesToPlay) else { return }
+        segmentBuffer.frameLength = framesToPlay
+
+        // チャンネルごとにデータをコピー
+        let channelCount = Int(audioFormat.channelCount)
+        if let srcFloats = audioBuffer.floatChannelData,
+           let dstFloats = segmentBuffer.floatChannelData {
+            for ch in 0..<channelCount {
+                dstFloats[ch].update(from: srcFloats[ch].advanced(by: Int(startFrame)), count: Int(framesToPlay))
+            }
+        }
+
+        playerNode.stop()
+        playerNode.scheduleBuffer(segmentBuffer, at: nil, options: [], completionHandler: nil)
+        playerNode.play()
+
+        lastScheduledTime = clampedSec
+    }
+
+    /// スクラブ終了
+    func stop() {
+        isActive = false
+        playerNode?.stop()
+    }
+
+    /// リソース解放
+    func teardown() {
+        isActive = false
+        playerNode?.stop()
+        engine?.stop()
+        playerNode = nil
+        varispeed = nil
+        engine = nil
+        audioBuffer = nil
+        audioFormat = nil
+        loadedURL = nil
+    }
+}
 
 // MARK: - PlaybackController
 // Timer・AVPlayer の状態をクラスで管理することで、
@@ -25,6 +259,18 @@ final class PlaybackController: ObservableObject {
     private var isSeeking = false
     /// シークのたびにインクリメント。古いシークコールバックを無効化するために使う
     private var seekGeneration: Int = 0
+    /// スクラブ中フラグ
+    var isScrubbing = false
+    /// トリムハンドルドラッグ中フラグ（tolerant seek を使う）
+    var isTrimming = false
+    /// トリムドラッグ中のシークスロットル（前回シーク時刻）
+    private var lastTrimSeekTime: CFAbsoluteTime = 0
+    /// AudioEngine ベースのスクラブ再生
+    let audioScrubber = AudioScrubber()
+    /// 前回のスクラブ playheadTime（速度算出用）
+    private var prevScrubSec: Double = 0
+    /// 前回のスクラブ CFTime（速度算出用）
+    private var prevScrubCFTime: CFAbsoluteTime = 0
     /// 黒画面区間の再生用：区間終了時刻
     private var blackUntil: Double = 0
     /// totalDuration キャッシュ（tick 内で参照）
@@ -37,8 +283,12 @@ final class PlaybackController: ObservableObject {
     /// 各デバイスの映像開始オフセット（音声同期のシークに使用）
     var videoStartByDevice: [String: Double] = [:]
 
+    /// video URL キャッシュ（スクラブ用音声ロードに使う）
+    private var videoURLs: [String: URL] = [:]
+
     func setup(videos: [String: URL]) {
         players = videos.mapValues { AVPlayer(url: $0) }
+        videoURLs = videos
     }
 
     func teardown() {
@@ -46,6 +296,7 @@ final class PlaybackController: ObservableObject {
         preloadedNext = nil
         players.values.forEach { $0.pause() }
         stopTimer()
+        audioScrubber.teardown()
     }
 
     // MARK: - Audio Source Sync
@@ -142,9 +393,14 @@ final class PlaybackController: ObservableObject {
                 pausePlayer(for: activePreviewDevice)
                 activePreviewDevice = device
             }
+
+            let target = CMTimeMakeWithSeconds(srcTime, preferredTimescale: 600)
+            let useTolerant = isScrubbing || isTrimming
+            let tolerance = CMTimeMakeWithSeconds(useTolerant ? 0.05 : 0, preferredTimescale: 600)
             players[device]?.seek(
-                to: CMTimeMakeWithSeconds(srcTime, preferredTimescale: 600),
-                toleranceBefore: .zero, toleranceAfter: .zero
+                to: target,
+                toleranceBefore: tolerance,
+                toleranceAfter: tolerance
             )
         } else {
             // セグメント外 → 全プレイヤー停止・黒画面（音声ソースは継続）
@@ -166,6 +422,116 @@ final class PlaybackController: ObservableObject {
             }
             activePreviewDevice = ""
         }
+    }
+
+    /// トリム中のスロットル付きシーク（30ms間隔で間引く）
+    func throttledSeekForTrim(to seconds: Double, timeline: ExclusiveEditTimeline, selectedDevice: String) {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastTrimSeekTime >= 0.03 else { return }
+        lastTrimSeekTime = now
+        seekPreview(to: seconds, timeline: timeline, selectedDevice: selectedDevice)
+    }
+
+    // MARK: - Scrub Audio (AudioEngine-based vinyl/tape style)
+
+    /// 現在スクラブに使用中のデバイス名
+    private var scrubAudioDevice: String = ""
+
+    /// スクラブ開始
+    func startScrubAudio(at seconds: Double, timeline: ExclusiveEditTimeline) {
+        isScrubbing = true
+        prevScrubSec = seconds
+        prevScrubCFTime = CFAbsoluteTimeGetCurrent()
+        scrubAudioDevice = ""
+
+        // 最初の音声ソースを特定してロード
+        loadScrubAudioIfNeeded(at: seconds, timeline: timeline)
+        audioScrubber.start()
+    }
+
+    /// スクラブ対象デバイスを特定し、必要なら AudioScrubber にロードする
+    private func loadScrubAudioIfNeeded(at seconds: Double, timeline: ExclusiveEditTimeline) {
+        let targetDevice: String
+        if let srcDevice = audioSourceDevice {
+            // 音声ソース指定あり → 常にそのデバイス
+            targetDevice = srcDevice
+        } else if let device = timeline.activeDevice(at: seconds) {
+            // 編集タイムラインに従い、現在位置のデバイスを使う
+            targetDevice = device
+        } else {
+            // セグメント外（ギャップ）→ 音声なし
+            if !scrubAudioDevice.isEmpty {
+                audioScrubber.stop()
+                scrubAudioDevice = ""
+            }
+            return
+        }
+
+        // デバイスが変わったらリロード
+        if targetDevice != scrubAudioDevice {
+            guard let url = videoURLs[targetDevice] else { return }
+            audioScrubber.loadAudio(from: url)
+            if audioScrubber.isActive {
+                // すでに start 済みなら再開
+                audioScrubber.start()
+            }
+            scrubAudioDevice = targetDevice
+        }
+    }
+
+    /// スクラブ中: ドラッグ速度からレートを算出し AudioScrubber を更新
+    func updateScrubAudio(at seconds: Double, timeline: ExclusiveEditTimeline) {
+        guard isScrubbing else { return }
+
+        // デバイス変更チェック（EDIT でセグメント境界を跨いだ場合）
+        loadScrubAudioIfNeeded(at: seconds, timeline: timeline)
+        guard !scrubAudioDevice.isEmpty else {
+            audioScrubber.update(positionInSource: 0, velocity: 0)
+            return
+        }
+
+        // ドラッグ速度（秒/秒）を算出
+        let now = CFAbsoluteTimeGetCurrent()
+        let dtWall = now - prevScrubCFTime
+        let dtTimeline = seconds - prevScrubSec
+
+        let velocity: Double
+        if dtWall > 0.001 {
+            velocity = dtTimeline / dtWall
+        } else {
+            velocity = 0
+        }
+
+        prevScrubSec = seconds
+        prevScrubCFTime = now
+
+        // ソースファイル内の時刻を算出
+        let seekTime: Double
+        if let srcDevice = audioSourceDevice,
+           let videoStart = videoStartByDevice[srcDevice] {
+            // 音声ソース指定: 録画全体の中での位置
+            seekTime = seconds - videoStart
+        } else if let seg = timeline.segments(for: scrubAudioDevice)
+            .filter({ $0.isValid })
+            .first(where: { $0.trimIn <= seconds && seconds < $0.trimOut }) {
+            // セグメント内: trimIn からのオフセットを sourceInTime に加算
+            seekTime = seg.sourceInTime + (seconds - seg.trimIn)
+        } else {
+            audioScrubber.update(positionInSource: 0, velocity: 0)
+            return
+        }
+        guard seekTime >= 0 else { return }
+
+        audioScrubber.update(positionInSource: seekTime, velocity: velocity)
+    }
+
+    /// スクラブ終了: AudioScrubber を停止し正確にシーク
+    func stopScrubAudio(at seconds: Double, timeline: ExclusiveEditTimeline, selectedDevice: String) {
+        isScrubbing = false
+        audioScrubber.stop()
+        scrubAudioDevice = ""
+        // 最終位置に正確にシーク（映像表示を合わせる）
+        seekPreview(to: seconds, timeline: timeline, selectedDevice: selectedDevice)
     }
 
     func seekToSegment(device: String, seg: ClipSegment) {
@@ -541,6 +907,7 @@ struct PreviewView: View {
     @StateObject private var timeline = ExclusiveEditTimeline()
     @StateObject private var exportEngine = ExportEngine()
     @StateObject private var playback = PlaybackController()
+    @ObservedObject private var purchaseManager = PurchaseManager.shared
 
     @State private var selectedDevice: String = ""
     /// デバイスごとの編集モード状態（長押しで true になる）
@@ -551,6 +918,7 @@ struct PreviewView: View {
     @State private var previousSelectedDevice: String = ""
     @State private var thumbnails: [String: [UIImage]] = [:]
     @State private var previewAspectRatio: CGFloat = 16.0 / 9.0
+    @State private var availableHeight: CGFloat = 0
     @State private var timelineWidth: CGFloat = 1  // 後方互換のため残す（未使用）
     @State private var isPlayheadDragging: Bool = false
     @State private var showExportResult = false
@@ -632,17 +1000,28 @@ struct PreviewView: View {
                 emptyState
             } else {
                 GeometryReader { geo in
+                    let totalH = geo.size.height
+                    let headerH: CGFloat = max(56, windowSafeAreaTop + 42)
+                    let contentH = totalH - headerH
+                    let areaA = contentH * 0.4   // プレビュー（40%）
+                    let areaB = contentH * 0.6   // タイムライン+コントロール（60%）
+                    let _ = updateAvailableHeight(totalH)
+
                     VStack(spacing: 0) {
                         headerBar
+                            .frame(height: headerH)
+
                         previewArea
-                        timelineSection
-                        Spacer(minLength: 0)
-                        playbackControls
+                            .frame(height: areaA)
+
+                        VStack(spacing: 0) {
+                            timelineSection
+                            playbackControls
+                        }
+                        .frame(height: areaB)
                     }
-                    .padding(.leading, geo.safeAreaInsets.leading)
-                    .padding(.trailing, geo.safeAreaInsets.trailing)
+                    .frame(height: totalH)
                 }
-                .ignoresSafeArea(.container, edges: .horizontal)
             }
         }
         .background(Color.black.ignoresSafeArea())
@@ -721,15 +1100,35 @@ struct PreviewView: View {
 
     // MARK: - Preview Area
 
+    /// GeometryReader の高さを State に反映する（body 内の let _ = ... で呼ぶ）
+    private func updateAvailableHeight(_ h: CGFloat) {
+        if abs(availableHeight - h) > 1 {
+            DispatchQueue.main.async { availableHeight = h }
+        }
+    }
+
     private var previewContainerHeight: CGFloat {
-        // UIScreen は向きに追従しないので GeometryReader で得た実際のウィンドウサイズを使う
-        // ここでは安全な上限として画面の短辺 × 0.45 を用いる
         let bounds = UIScreen.main.bounds
-        let shortSide = min(bounds.width, bounds.height)
-        let longSide  = max(bounds.width, bounds.height)
-        // 縦向き想定の幅を使ってアスペクト比から高さを計算し、上限を設ける
-        let h = shortSide / previewAspectRatio
-        return min(h, longSide * 0.40)
+        let screenW = min(bounds.width, bounds.height)
+        // アスペクト比から理想の高さ
+        let idealH = screenW / previewAspectRatio
+
+        // 他のUI要素に必要な高さを動的に計算
+        let headerH: CGFloat = 56
+        let rowH: CGFloat = 56
+        let rowCount = CGFloat(min(sortedDevices.count, 5))
+        let timelineH: CGFloat = rowCount * rowH + 3 * max(rowCount - 1, 0) + 8 + 60 + 40 // tracks + knob + scroll
+        let playbackH: CGFloat = 170  // zoom bar + play button + padding
+        let reservedForUI = headerH + timelineH + playbackH
+
+        let maxH: CGFloat
+        if availableHeight > 100 {
+            maxH = availableHeight - reservedForUI
+        } else {
+            maxH = max(bounds.width, bounds.height) * 0.35
+        }
+
+        return max(100, min(idealH, maxH))
     }
 
     private var previewArea: some View {
@@ -770,8 +1169,7 @@ struct PreviewView: View {
             .brightness(filterPreviewBrightness)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity)
-        .frame(height: previewContainerHeight)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
     }
     /// フィルタプレビュー用パラメータ
@@ -869,7 +1267,7 @@ struct PreviewView: View {
 
                 // 書き出しボタン
                 Button {
-                    Task { await exportEngine.export(timeline: timeline, videos: videos, orientation: desiredOrientation, audioSource: audioSource, videoFilter: selectedFilter) }
+                    Task { await exportEngine.export(timeline: timeline, videos: videos, orientation: desiredOrientation, audioSource: audioSource, videoFilter: selectedFilter, showWatermark: !purchaseManager.isPremium) }
                 } label: {
                     Image(systemName: "square.and.arrow.up")
                         .font(.system(size: 18, weight: .semibold))
@@ -884,7 +1282,15 @@ struct PreviewView: View {
                 }())
             }
         }
-        .padding(.horizontal, 20).padding(.vertical, 14)
+        .padding(.horizontal, 20)
+        .padding(.top, max(14, windowSafeAreaTop))
+        .padding(.bottom, 14)
+    }
+
+    /// UIWindow から直接取得した top safe area inset（fullScreenCover 内でも確実）
+    private var windowSafeAreaTop: CGFloat {
+        (UIApplication.shared.connectedScenes.first as? UIWindowScene)?
+            .keyWindow?.safeAreaInsets.top ?? 0
     }
 
     private func commitRename() {
@@ -1093,6 +1499,80 @@ struct PreviewView: View {
     /// スクロール専用ストリップの高さ
     private let scrollStripH: CGFloat = 40
 
+    /// TimelineRow を生成するヘルパー（型チェッカー負荷軽減のため分離）
+    @ViewBuilder
+    private func makeTimelineRow(device: String) -> some View {
+        TimelineRow(
+            deviceName: device,
+            thumbnails: thumbnails[device] ?? [],
+            isSelected: selectedDevice == device,
+            isEditing: editingDevices.contains(device),
+            segments: timeline.segments(for: device),
+            totalDuration: totalDuration,
+            videoStart:    timeline.videoRangeByDevice[device]?.start    ?? 0,
+            videoEnd:      timeline.videoRangeByDevice[device]?.end      ?? totalDuration,
+            videoDuration: timeline.videoRangeByDevice[device]?.duration ?? totalDuration,
+            editingSegmentID: editingSegmentIDs[device],
+            zoomScale: zoomScale,
+            inverseScaleX: isPinching && committedZoomScale > 0.01
+                ? committedZoomScale / zoomScale : 1.0,
+            isLocked: timeline.lockedDevices.contains(device),
+            showLabel: false,
+            onTrimIn: { segID, newSec in
+                editingSegmentIDs[device] = segID
+                playback.isTrimming = true
+                timeline.moveTrimIn(segmentID: segID, device: device, newTrimIn: newSec)
+                let actual = timeline.segments(for: device).first(where: { $0.id == segID })?.trimIn ?? newSec
+                playback.playheadTime = actual
+                playback.throttledSeekForTrim(to: actual, timeline: timeline, selectedDevice: device)
+            },
+            onTrimOut: { segID, newSec in
+                editingSegmentIDs[device] = segID
+                playback.isTrimming = true
+                timeline.moveTrimOut(segmentID: segID, device: device, newTrimOut: newSec)
+                let actual = timeline.segments(for: device).first(where: { $0.id == segID })?.trimOut ?? newSec
+                playback.playheadTime = actual
+                playback.throttledSeekForTrim(to: actual, timeline: timeline, selectedDevice: device)
+            },
+            onCommitSelection: { trimIn, trimOut in
+                timeline.applySelection(trimIn: trimIn, trimOut: trimOut, for: device)
+                editingDevices.remove(device)
+                editingSegmentIDs.removeValue(forKey: device)
+            },
+            onAddSegment: { seconds, trackWidth in
+                timeline.addSegment(around: seconds, for: device, trackWidth: trackWidth)
+                if let newSeg = timeline.segments(for: device).last {
+                    editingSegmentIDs[device] = newSeg.id
+                }
+                playback.playheadTime = seconds
+                playback.seekPreview(to: seconds, timeline: timeline, selectedDevice: device)
+                editingDevices.insert(device)
+            },
+            onTap: { handleDeviceTap(device) },
+            onSegmentTap: { segID in
+                print("[PARENT] onSegmentTap device=\(device) seg=\(segID) editing=\(editingDevices) current=\(selectedDevice)")
+                handleDeviceTap(device)
+                editingSegmentIDs[device] = segID
+                editingDevices.insert(device)
+                timeline.commitAllSegments(for: device)
+                if let seg = timeline.segments(for: device).first(where: { $0.id == segID }) {
+                    playback.playheadTime = seg.trimIn
+                    playback.seekPreview(to: seg.trimIn, timeline: timeline, selectedDevice: device)
+                }
+            },
+            onDeleteSegment: { segID in
+                print("[PARENT] onDeleteSegment device=\(device) seg=\(segID)")
+                timeline.removeSegment(segmentID: segID, device: device)
+                editingSegmentIDs.removeValue(forKey: device)
+                editingDevices.remove(device)
+            },
+            onTrimEnd: {
+                playback.isTrimming = false
+                playback.seekPreview(to: playback.playheadTime, timeline: timeline, selectedDevice: selectedDevice)
+            }
+        )
+    }
+
     private var timelineSection: some View {
         let rowH: CGFloat = 56
         let rowCount = min(sortedDevices.count, 5)
@@ -1147,78 +1627,7 @@ struct PreviewView: View {
                             ZStack(alignment: .topLeading) {
                                 VStack(spacing: 3) {
                                     ForEach(sortedDevices, id: \.self) { device in
-                                        TimelineRow(
-                                            deviceName: device,
-                                            thumbnails: thumbnails[device] ?? [],
-                                            isSelected: selectedDevice == device,
-                                            isEditing: editingDevices.contains(device),
-                                            segments: timeline.segments(for: device),
-                                            totalDuration: totalDuration,
-                                            videoStart:    timeline.videoRangeByDevice[device]?.start    ?? 0,
-                                            videoEnd:      timeline.videoRangeByDevice[device]?.end      ?? totalDuration,
-                                            videoDuration: timeline.videoRangeByDevice[device]?.duration ?? totalDuration,
-                                            editingSegmentID: editingSegmentIDs[device],
-                                            zoomScale: zoomScale,
-                                            isLocked: timeline.lockedDevices.contains(device),
-                                            showLabel: false,
-                                            onTrimIn: { segID, newSec in
-                                                editingSegmentIDs[device] = segID
-                                                timeline.moveTrimIn(segmentID: segID, device: device, newTrimIn: newSec)
-                                                // クランプ後の実際の trimIn に合わせる
-                                                let actual = timeline.segments(for: device).first(where: { $0.id == segID })?.trimIn ?? newSec
-                                                playback.playheadTime = actual
-                                                playback.seekPreview(to: actual, timeline: timeline, selectedDevice: device)
-                                            },
-                                            onTrimOut: { segID, newSec in
-                                                editingSegmentIDs[device] = segID
-                                                timeline.moveTrimOut(segmentID: segID, device: device, newTrimOut: newSec)
-                                                // クランプ後の実際の trimOut に合わせる
-                                                let actual = timeline.segments(for: device).first(where: { $0.id == segID })?.trimOut ?? newSec
-                                                playback.playheadTime = actual
-                                                playback.seekPreview(to: actual, timeline: timeline, selectedDevice: device)
-                                            },
-                                            onSlide: { segID, deltaSec in
-                                                editingSegmentIDs[device] = segID
-                                                timeline.moveSegment(segmentID: segID, device: device, deltaSeconds: deltaSec)
-                                                if let seg = timeline.segments(for: device).first(where: { $0.id == segID }) {
-                                                    playback.playheadTime = seg.trimIn
-                                                    playback.seekPreview(to: seg.trimIn, timeline: timeline, selectedDevice: device)
-                                                }
-                                            },
-                                            onCommitSelection: { trimIn, trimOut in
-                                                timeline.applySelection(trimIn: trimIn, trimOut: trimOut, for: device)
-                                                editingDevices.remove(device)
-                                                editingSegmentIDs.removeValue(forKey: device)
-                                            },
-                                            onAddSegment: { seconds, trackWidth in
-                                                timeline.addSegment(around: seconds, for: device, trackWidth: trackWidth)
-                                                if let newSeg = timeline.segments(for: device).last {
-                                                    editingSegmentIDs[device] = newSeg.id
-                                                }
-                                                playback.playheadTime = seconds
-                                                playback.seekPreview(to: seconds, timeline: timeline, selectedDevice: device)
-                                                editingDevices.insert(device)
-                                            },
-                                            onTap: { handleDeviceTap(device) },
-                                            onSegmentTap: { segID in
-                                                // デバイスを選択状態にしてから編集対象セグメントを切り替える
-                                                handleDeviceTap(device)
-                                                editingSegmentIDs[device] = segID
-                                                editingDevices.insert(device)
-                                                // タップ時点で排他制約を強制適用
-                                                timeline.commitAllSegments(for: device)
-                                                // タップしたセグメントの先頭にプレイヘッドを移動
-                                                if let seg = timeline.segments(for: device).first(where: { $0.id == segID }) {
-                                                    playback.playheadTime = seg.trimIn
-                                                    playback.seekPreview(to: seg.trimIn, timeline: timeline, selectedDevice: device)
-                                                }
-                                            },
-                                            onDeleteSegment: { segID in
-                                                timeline.removeSegment(segmentID: segID, device: device)
-                                                editingSegmentIDs.removeValue(forKey: device)
-                                                editingDevices.remove(device)
-                                            }
-                                        )
+                                        makeTimelineRow(device: device)
                                     }
                                 }
                                 .padding(.leading, trackInnerPad)
@@ -1315,7 +1724,7 @@ struct PreviewView: View {
                                 scrollProxy.scrollTo("scroll-anchor-\(req.anchorID)", anchor: .center)
                             }
                         }
-                        .scrollDisabled(committedZoomScale <= 1.0)
+                        .scrollDisabled(true)
                         .coordinateSpace(name: "timelineScroll")
                     }
                 }
@@ -1441,17 +1850,24 @@ struct PreviewView: View {
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { v in
-                            isPlayheadDragging = true
                             let startRatio = max(0, min(1,
                                 (v.startLocation.x - scrollLeftPad) / effectiveTrackWidth))
                             let deltaRatio = v.translation.width / effectiveTrackWidth
                             let r = max(0, min(1, CGFloat(startRatio) + deltaRatio))
                             let sec = Double(r) * totalDuration
+                            if !isPlayheadDragging {
+                                // ドラッグ開始
+                                isPlayheadDragging = true
+                                playback.startScrubAudio(at: sec, timeline: timeline)
+                            }
                             playback.playheadTime = sec
                             playback.seekPreview(to: sec, timeline: timeline, selectedDevice: selectedDevice)
+                            playback.updateScrubAudio(at: sec, timeline: timeline)
                         }
                         .onEnded { _ in
+                            let sec = playback.playheadTime
                             isPlayheadDragging = false
+                            playback.stopScrubAudio(at: sec, timeline: timeline, selectedDevice: selectedDevice)
                         }
                 )
         }
@@ -1739,6 +2155,7 @@ struct PreviewView: View {
                             .offset(x: leftSize * 0.06, y: -leftSize * 0.06)
                     }
                 }
+                .frame(width: 36, height: 36) // 固定フレームでサイズ変化が親レイアウトに伝播しない
                 .offset(x: -faceSpread)
                 .animation(.spring(response: 0.3, dampingFraction: 0.55), value: faceSpread)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6), value: leftCircleTapped)
@@ -1800,6 +2217,7 @@ struct PreviewView: View {
                             .offset(x: -rightSize * 0.06, y: -rightSize * 0.06)
                     }
                 }
+                .frame(width: 36, height: 36) // 固定フレームでサイズ変化が親レイアウトに伝播しない
                 .offset(x: faceSpread)
                 .animation(.spring(response: 0.3, dampingFraction: 0.55), value: faceSpread)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6), value: rightCircleTapped)
@@ -1984,6 +2402,12 @@ struct PreviewView: View {
         // サムネイル取得 + アスペクト比設定
         await generateAllThumbnails()
         previewAspectRatio = desiredOrientation.aspectRatio
+
+        // スクラブ用音声を事前ロード（最初のデバイスまたは音声ソースデバイス）
+        let scrubDevice = playback.audioSourceDevice ?? playback.activePreviewDevice
+        if let url = videos[scrubDevice] {
+            playback.audioScrubber.loadAudio(from: url)
+        }
     }
 
     // MARK: - Playback Logic（seekPreview / toggle / seekToSegment は PlaybackController へ移譲済み）
@@ -2037,6 +2461,8 @@ private struct TimelineRow: View {
     let editingSegmentID: UUID?
     /// 親から渡されるズーム倍率（ロングプレスの trackWidth 計算に使う）
     let zoomScale: CGFloat
+    /// ピンチ中の scaleEffect を打ち消す逆スケール値（ハンドル幅の伸び防止）
+    var inverseScaleX: CGFloat = 1.0
     /// デバイスがロックされているか
     var isLocked: Bool = false
     /// false のときラベル列を非表示にする（ラベルを ScrollView 外に固定するため）
@@ -2044,7 +2470,6 @@ private struct TimelineRow: View {
 
     let onTrimIn:          (UUID, Double) -> Void
     let onTrimOut:         (UUID, Double) -> Void
-    let onSlide:           (UUID, Double) -> Void
     let onCommitSelection: (Double, Double) -> Void
     let onAddSegment:      (_ seconds: Double, _ trackWidth: CGFloat) -> Void
     let onTap: () -> Void
@@ -2052,12 +2477,12 @@ private struct TimelineRow: View {
     var onSegmentTap: ((UUID) -> Void)? = nil
     /// トリムハンドルのダブルタップでセグメントを削除する
     var onDeleteSegment: ((UUID) -> Void)? = nil
+    /// トリムドラッグ終了時のコールバック
+    var onTrimEnd: (() -> Void)? = nil
 
     @State private var draggingID: UUID? = nil
     @State private var dragStartX: CGFloat = 0
-    @State private var slideStartTrimIn: Double = 0
     @State private var longPressLocation: CGFloat = 0
-    @State private var longPressTimer: Timer? = nil
 
     private let labelWidth:  CGFloat = 52
     private let thumbHeight: CGFloat = 52
@@ -2092,31 +2517,28 @@ private struct TimelineRow: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     // ① ベース：サムネイル表示（暗め）+ 長押しでセグメント追加
-                    //    長押しジェスチャーはベースレイヤーに付けることで、
-                    //    セグメントやトリムハンドルのジェスチャーと競合しない
+                    //    LongPressGesture を使うことで、タップやドラッグは上のレイヤーに通す
                     thumbnailStrip(width: geo.size.width, dimmed: true)
                         .contentShape(Rectangle())
-                        .gesture(
-                            isLocked ? nil :
+                        .onLongPressGesture(minimumDuration: 0.4) {
+                            guard !isLocked else { return }
+                            let capturedWidth = geo.size.width
+                            guard totalDuration > 0, capturedWidth > 0 else { return }
+                            let ratio = max(0, min(1, longPressLocation / capturedWidth))
+                            let seconds = Double(ratio) * totalDuration
+                            print("[TIMELINE] longPress ADD segment device=\(deviceName) sec=\(seconds)")
+                            onAddSegment(seconds, capturedWidth)
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            onTap()
+                        } onPressingChanged: { pressing in
+                            if !pressing {
+                                longPressLocation = 0
+                            }
+                        }
+                        .simultaneousGesture(
                             DragGesture(minimumDistance: 0)
                                 .onChanged { v in
-                                    guard longPressTimer == nil else { return }
                                     longPressLocation = v.location.x
-                                    let capturedWidth = geo.size.width
-                                    longPressTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { _ in
-                                        Task { @MainActor in
-                                            guard self.totalDuration > 0, capturedWidth > 0 else { return }
-                                            let ratio = max(0, min(1, self.longPressLocation / capturedWidth))
-                                            let seconds = Double(ratio) * self.totalDuration
-                                            self.onAddSegment(seconds, capturedWidth)
-                                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                                            self.onTap()
-                                        }
-                                    }
-                                }
-                                .onEnded { _ in
-                                    longPressTimer?.invalidate()
-                                    longPressTimer = nil
                                 }
                         )
                     // ② 使用範囲ごとにサムネイルを明るくくり抜く＋常に青枠
@@ -2224,13 +2646,11 @@ private struct TimelineRow: View {
                     // 青枠エリアをタップ → このセグメントを編集対象に選択
                     .contentShape(Rectangle())
                     .onTapGesture {
+                        print("[TIMELINE] segmentTap: \(seg.id) device=\(deviceName)")
                         onSegmentTap?(seg.id)
                     }
-                    // 横スワイプがScrollViewに伝播しないよう消費
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 5)
-                            .onChanged { _ in }
-                    )
+                    // 編集中セグメントはトリムハンドルにタッチを譲る
+                    .allowsHitTesting(seg.id != editingSegmentID)
                     Spacer(minLength: 0)
                 }
                 .frame(width: width, height: thumbHeight)
@@ -2293,19 +2713,23 @@ private struct TimelineRow: View {
 
             ZStack(alignment: .topLeading) {
                 // 上下ボーダー：常時表示（選択中を示す）
+                // ボーダーの線幅が scaleEffect で伸びるのを防ぐため、逆スケール補正した lineWidth を使用
+                let borderW: CGFloat = (isDragging ? 3 : 2.5) * inverseScaleX
                 Path { path in
                     path.move(to: CGPoint(x: inX, y: 0))
                     path.addLine(to: CGPoint(x: outX, y: 0))
                     path.move(to: CGPoint(x: inX, y: thumbHeight))
                     path.addLine(to: CGPoint(x: outX, y: thumbHeight))
                 }
-                .stroke(trimHandleColor.opacity(isDragging ? 1.0 : 0.9), lineWidth: isDragging ? 3 : 2.5)
+                .stroke(isDragging ? Color.red : trimHandleColor.opacity(0.9), lineWidth: borderW)
                 .allowsHitTesting(false)
 
                 // IN点ハンドル：右端を inX に合わせる
-                handleBar(isLeading: true)
+                handleBar(isLeading: true, isDragging: isDragging)
                     .frame(width: handleWidth, height: thumbHeight)
-                    .offset(x: inX - handleWidth)
+                    .scaleEffect(x: inverseScaleX, y: 1.0)
+                    .padding(.horizontal, 20)  // タッチ領域拡大
+                    .offset(x: inX - handleWidth - 20)
                     .onTapGesture(count: 2) {
                         onDeleteSegment?(seg.id)
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -2313,16 +2737,18 @@ private struct TimelineRow: View {
                     .gesture(inHandleGesture(seg: seg, width: width))
 
                 // OUT点ハンドル：左端を outX に合わせる
-                handleBar(isLeading: false)
+                handleBar(isLeading: false, isDragging: isDragging)
                     .frame(width: handleWidth, height: thumbHeight)
-                    .offset(x: outX)
+                    .scaleEffect(x: inverseScaleX, y: 1.0)
+                    .padding(.horizontal, 20)  // タッチ領域拡大
+                    .offset(x: outX - 20)
                     .onTapGesture(count: 2) {
                         onDeleteSegment?(seg.id)
                         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     }
                     .gesture(outHandleGesture(seg: seg, width: width))
 
-                // 中央エリア：スライドのみ（確定は別デバイス選択時）
+                // 中央エリア：ダブルタップで削除のみ
                 if rangeW > 0 {
                     Color.clear
                         .frame(width: rangeW, height: thumbHeight)
@@ -2332,20 +2758,21 @@ private struct TimelineRow: View {
                             onDeleteSegment?(seg.id)
                             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                         }
-                        .gesture(slideGesture(seg: seg, width: width))
                 }
 
                 // IN点の縦線
                 Rectangle()
-                    .fill(trimHandleColor)
+                    .fill(isDragging ? Color.red : trimHandleColor)
                     .frame(width: 1, height: thumbHeight)
+                    .scaleEffect(x: inverseScaleX, y: 1.0)
                     .offset(x: inX)
                     .allowsHitTesting(false)
 
                 // OUT点の縦線
                 Rectangle()
-                    .fill(trimHandleColor)
+                    .fill(isDragging ? Color.red : trimHandleColor)
                     .frame(width: 1, height: thumbHeight)
+                    .scaleEffect(x: inverseScaleX, y: 1.0)
                     .offset(x: outX - 1)
                     .allowsHitTesting(false)
             }
@@ -2353,15 +2780,19 @@ private struct TimelineRow: View {
         }
     }
 
-    /// Photos風ハンドルバー：黄色塗り + シェブロン
-    private func handleBar(isLeading: Bool) -> some View {
-        RoundedRectangle(cornerRadius: 4)
-            .fill(trimHandleColor)
+    /// Photos風ハンドルバー：黄色塗り + シェブロン（ドラッグ中は赤系に変化）
+    private func handleBar(isLeading: Bool, isDragging: Bool = false) -> some View {
+        let bgColor = isDragging ? Color.red : trimHandleColor
+        let chevronColor: Color = isDragging ? .white : .black.opacity(0.4)
+        return RoundedRectangle(cornerRadius: 4)
+            .fill(bgColor)
             .overlay(
                 Image(systemName: isLeading ? "chevron.compact.left" : "chevron.compact.right")
                     .font(.system(size: 16, weight: .heavy))
-                    .foregroundColor(.black.opacity(0.4))
+                    .foregroundColor(chevronColor)
             )
+            // タッチ領域をハンドル幅の3倍に拡大（ズーム時でも押しやすくする）
+            .contentShape(Rectangle().inset(by: -20))
     }
 
     // MARK: サムネイルコンテンツ共通
@@ -2409,11 +2840,12 @@ private struct TimelineRow: View {
     // MARK: ジェスチャー
 
     private func inHandleGesture(seg: ClipSegment, width: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 0)
+        DragGesture(minimumDistance: 4)
             .onChanged { v in
                 if draggingID != seg.id {
                     draggingID = seg.id
                     dragStartX = seg.trimInRatio(total: totalDuration) * width
+                    print("[TRIM] IN drag START seg=\(seg.id) device=\(deviceName) startX=\(dragStartX)")
                 }
                 let absX   = dragStartX + v.translation.width
                 let ratio  = max(0, min(1, absX / width))
@@ -2421,18 +2853,20 @@ private struct TimelineRow: View {
                 onTrimIn(seg.id, newSec)
             }
             .onEnded { _ in
+                print("[TRIM] IN drag END seg=\(draggingID?.uuidString.prefix(8) ?? "nil") device=\(deviceName)")
                 draggingID = nil
                 dragStartX = 0
-                // 確定はダブルタップで行うため、onEnded では何もしない
+                onTrimEnd?()
             }
     }
 
     private func outHandleGesture(seg: ClipSegment, width: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 0)
+        DragGesture(minimumDistance: 4)
             .onChanged { v in
                 if draggingID != seg.id {
                     draggingID = seg.id
                     dragStartX = seg.trimOutRatio(total: totalDuration) * width
+                    print("[TRIM] OUT drag START seg=\(seg.id) device=\(deviceName) startX=\(dragStartX)")
                 }
                 let absX   = dragStartX + v.translation.width
                 let ratio  = max(0, min(1, absX / width))
@@ -2440,30 +2874,14 @@ private struct TimelineRow: View {
                 onTrimOut(seg.id, newSec)
             }
             .onEnded { _ in
+                print("[TRIM] OUT drag END seg=\(draggingID?.uuidString.prefix(8) ?? "nil") device=\(deviceName)")
                 draggingID = nil
                 dragStartX = 0
-                // 確定はダブルタップで行うため、onEnded では何もしない
+                onTrimEnd?()
             }
     }
 
-    private func slideGesture(seg: ClipSegment, width: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 2)
-            .onChanged { v in
-                if draggingID != seg.id {
-                    draggingID = seg.id
-                    slideStartTrimIn = seg.trimIn
-                }
-                let deltaSec  = Double(v.translation.width / width) * totalDuration
-                let targetIn  = slideStartTrimIn + deltaSec
-                let currentIn = seg.trimIn
-                onSlide(seg.id, targetIn - currentIn)
-            }
-            .onEnded { _ in
-                draggingID = nil
-                slideStartTrimIn = 0
-                // 確定はダブルタップで行うため、onEnded では何もしない
-            }
-    }
+
 }
 
 // MARK: - FillPlayerView (AVPlayerLayer with resizeAspectFill)
