@@ -160,13 +160,17 @@ struct LibraryView: View {
                             .foregroundColor(.white)
                     }
 
-                    HStack(spacing: 8) {
-                        Text(record.createdAt.formatted(date: .abbreviated, time: .shortened))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text({
+                            let c = Calendar.current
+                            let y = c.component(.year, from: record.createdAt)
+                            let m = c.component(.month, from: record.createdAt)
+                            let d = c.component(.day, from: record.createdAt)
+                            return "\(y)/\(m)/\(d)"
+                        }())
                             .font(.caption)
                             .foregroundColor(.white.opacity(0.4))
-                        Text("·")
-                            .foregroundColor(.white.opacity(0.3))
-                        Text("\(record.videoPaths.count) clips")
+                        Text("\(record.videoPaths.count) Clips : \(orientationLabel(record.desiredOrientation))")
                             .font(.caption)
                             .foregroundColor(.white.opacity(0.4))
                     }
@@ -229,6 +233,17 @@ struct LibraryView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
+    }
+
+    // MARK: - Helpers
+
+    private func orientationLabel(_ raw: String?) -> String {
+        switch raw {
+        case "横（シネマ）": return "Cinema"
+        case "横（テレビ）": return "TV"
+        case "縦（スマホ）": return "Phone"
+        default:            return "—"
+        }
     }
 
     // MARK: - Selection

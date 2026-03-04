@@ -9,239 +9,6 @@ import AVFoundation
 import AVFAudio
 import Combine
 
-// MARK: - AudioScrubber
-// AVAudioEngine + AVAudioPlayerNode + AVAudioUnitVarispeed で
-// ドラッグ速度に応じたピッチ変化付きスクラブ再生を実現する（レコード/テープ風）
-
-final class AudioScrubber {
-    private var engine: AVAudioEngine?
-    private var playerNode: AVAudioPlayerNode?
-    private var varispeed: AVAudioUnitVarispeed?
-    private var audioBuffer: AVAudioPCMBuffer?
-    private var audioFormat: AVAudioFormat?
-    private var audioSampleRate: Double = 44100
-    private var audioDuration: Double = 0
-
-    /// 現在ロード中のURL（再ロード防止）
-    private var loadedURL: URL?
-
-    /// スクラブ中かどうか
-    private(set) var isActive = false
-
-    /// 最後にスケジュールした再生位置（秒）
-    private var lastScheduledTime: Double = 0
-    private var lastUpdateCFTime: CFAbsoluteTime = 0
-
-    /// 動画ファイルから音声トラックを PCMバッファに展開する
-    /// AVAudioFile は .mov を開けないため、AVAssetReader で音声トラックを読む
-    func loadAudio(from videoURL: URL) {
-        // 同じファイルならスキップ
-        if loadedURL == videoURL && audioBuffer != nil { return }
-        teardown()
-
-        let asset = AVURLAsset(url: videoURL)
-        guard let audioTrack = asset.tracks(withMediaType: .audio).first else {
-            #if DEBUG
-            print("⚠️ [AudioScrubber] No audio track in: \(videoURL.lastPathComponent)")
-            #endif
-            return
-        }
-
-        // PCM Float32 で読み出す設定
-        let targetSampleRate: Double = 44100
-        let targetChannels: UInt32 = 1  // モノラルで十分（スクラブ用）
-        let outputSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVLinearPCMBitDepthKey: 32,
-            AVLinearPCMIsFloatKey: true,
-            AVLinearPCMIsNonInterleaved: true,
-            AVSampleRateKey: targetSampleRate,
-            AVNumberOfChannelsKey: targetChannels
-        ]
-
-        guard let reader = try? AVAssetReader(asset: asset) else {
-            #if DEBUG
-            print("⚠️ [AudioScrubber] Cannot create AVAssetReader")
-            #endif
-            return
-        }
-
-        let trackOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: outputSettings)
-        trackOutput.alwaysCopiesSampleData = false
-        reader.add(trackOutput)
-
-        guard reader.startReading() else {
-            #if DEBUG
-            print("⚠️ [AudioScrubber] AVAssetReader failed to start: \(reader.error?.localizedDescription ?? "?")")
-            #endif
-            return
-        }
-
-        // 全サンプルをメモリに読み込む
-        var allSamples: [Float] = []
-        allSamples.reserveCapacity(Int(targetSampleRate) * 120) // 最大2分を想定
-        while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
-            guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
-            var lengthAtOffset: Int = 0
-            var totalLength: Int = 0
-            var dataPointer: UnsafeMutablePointer<Int8>?
-            let status = CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: &lengthAtOffset, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
-            guard status == noErr, let ptr = dataPointer else { continue }
-            let floatCount = totalLength / MemoryLayout<Float>.size
-            ptr.withMemoryRebound(to: Float.self, capacity: floatCount) { floatPtr in
-                allSamples.append(contentsOf: UnsafeBufferPointer(start: floatPtr, count: floatCount))
-            }
-        }
-
-        guard !allSamples.isEmpty else {
-            #if DEBUG
-            print("⚠️ [AudioScrubber] No audio samples extracted")
-            #endif
-            return
-        }
-
-        // AVAudioPCMBuffer に変換
-        let frameCount = AVAudioFrameCount(allSamples.count)
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: targetSampleRate, channels: targetChannels),
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
-        buffer.frameLength = frameCount
-
-        if let channelData = buffer.floatChannelData {
-            allSamples.withUnsafeBufferPointer { src in
-                channelData[0].update(from: src.baseAddress!, count: Int(frameCount))
-            }
-        }
-
-        audioBuffer = buffer
-        audioFormat = format
-        audioSampleRate = targetSampleRate
-        audioDuration = Double(frameCount) / targetSampleRate
-        loadedURL = videoURL
-
-        // Engine セットアップ
-        let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        let vari = AVAudioUnitVarispeed()
-
-        engine.attach(player)
-        engine.attach(vari)
-        engine.connect(player, to: vari, format: format)
-        engine.connect(vari, to: engine.mainMixerNode, format: format)
-
-        self.engine = engine
-        self.playerNode = player
-        self.varispeed = vari
-
-        #if DEBUG
-        print("✅ [AudioScrubber] Loaded \(videoURL.lastPathComponent) — \(String(format: "%.1f", audioDuration))s, \(allSamples.count) samples")
-        #endif
-    }
-
-    /// スクラブ開始
-    func start() {
-        guard let engine, let playerNode else { return }
-        do {
-            if !engine.isRunning {
-                try engine.start()
-            }
-            playerNode.stop()
-            isActive = true
-            lastUpdateCFTime = CFAbsoluteTimeGetCurrent()
-        } catch {
-            #if DEBUG
-            print("⚠️ [AudioScrubber] Engine start failed: \(error)")
-            #endif
-        }
-    }
-
-    /// スクラブ更新: 位置(秒)とドラッグ速度(秒/秒)を渡す
-    /// velocity > 0: 順方向, velocity < 0: 逆方向
-    func update(positionInSource seconds: Double, velocity: Double) {
-        guard isActive,
-              let playerNode,
-              let audioBuffer,
-              let audioFormat else { return }
-
-        let now = CFAbsoluteTimeGetCurrent()
-        let dtSinceLastUpdate = now - lastUpdateCFTime
-
-        let absVelocity = abs(velocity)
-        // 速度が非常に小さい場合は無音（指が止まっている）
-        guard absVelocity > 0.05 else {
-            playerNode.stop()
-            lastScheduledTime = seconds
-            return
-        }
-
-        // 前回スケジュールからの予測再生位置（Varispeed rate を加味）
-        let currentRate = Double(varispeed?.rate ?? 1.0)
-        let predictedPos = lastScheduledTime + dtSinceLastUpdate * currentRate
-        let drift = abs(seconds - predictedPos)
-
-        // ドリフトが小さい（0.15秒未満）かつ前回から60ms未満 → 自然再生に任せる（ループ防止）
-        if drift < 0.15 && dtSinceLastUpdate < 0.06 {
-            // rate だけ更新
-            let newRate = Float(min(max(absVelocity, 0.25), 4.0))
-            varispeed?.rate = newRate
-            return
-        }
-
-        lastUpdateCFTime = now
-
-        // Varispeed rate: ドラッグ速度をレートに変換
-        let rate = Float(min(max(absVelocity, 0.25), 4.0))
-        varispeed?.rate = rate
-
-        // 再生位置（フレーム）
-        let clampedSec = max(0, min(seconds, audioDuration - 0.01))
-        let startFrame = AVAudioFramePosition(clampedSec * audioSampleRate)
-
-        // 長めの区間をスケジュール（約200ms分 — 次の update まで再生し続ける）
-        let chunkFrames = AVAudioFrameCount(audioSampleRate * 0.2)
-        let availableFrames = AVAudioFrameCount(audioBuffer.frameLength) - AVAudioFrameCount(startFrame)
-        let framesToPlay = min(chunkFrames, availableFrames)
-        guard framesToPlay > 0 else { return }
-
-        // バッファの部分再生用にセグメントバッファを作成
-        guard let segmentBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat, frameCapacity: framesToPlay) else { return }
-        segmentBuffer.frameLength = framesToPlay
-
-        // チャンネルごとにデータをコピー
-        let channelCount = Int(audioFormat.channelCount)
-        if let srcFloats = audioBuffer.floatChannelData,
-           let dstFloats = segmentBuffer.floatChannelData {
-            for ch in 0..<channelCount {
-                dstFloats[ch].update(from: srcFloats[ch].advanced(by: Int(startFrame)), count: Int(framesToPlay))
-            }
-        }
-
-        playerNode.stop()
-        playerNode.scheduleBuffer(segmentBuffer, at: nil, options: [], completionHandler: nil)
-        playerNode.play()
-
-        lastScheduledTime = clampedSec
-    }
-
-    /// スクラブ終了
-    func stop() {
-        isActive = false
-        playerNode?.stop()
-    }
-
-    /// リソース解放
-    func teardown() {
-        isActive = false
-        playerNode?.stop()
-        engine?.stop()
-        playerNode = nil
-        varispeed = nil
-        engine = nil
-        audioBuffer = nil
-        audioFormat = nil
-        loadedURL = nil
-    }
-}
-
 // MARK: - PlaybackController
 // Timer・AVPlayer の状態をクラスで管理することで、
 // struct（PreviewView）からのクロージャ参照問題を回避する
@@ -259,18 +26,10 @@ final class PlaybackController: ObservableObject {
     private var isSeeking = false
     /// シークのたびにインクリメント。古いシークコールバックを無効化するために使う
     private var seekGeneration: Int = 0
-    /// スクラブ中フラグ
-    var isScrubbing = false
     /// トリムハンドルドラッグ中フラグ（tolerant seek を使う）
     var isTrimming = false
     /// トリムドラッグ中のシークスロットル（前回シーク時刻）
     private var lastTrimSeekTime: CFAbsoluteTime = 0
-    /// AudioEngine ベースのスクラブ再生
-    let audioScrubber = AudioScrubber()
-    /// 前回のスクラブ playheadTime（速度算出用）
-    private var prevScrubSec: Double = 0
-    /// 前回のスクラブ CFTime（速度算出用）
-    private var prevScrubCFTime: CFAbsoluteTime = 0
     /// 黒画面区間の再生用：区間終了時刻
     private var blackUntil: Double = 0
     /// totalDuration キャッシュ（tick 内で参照）
@@ -283,12 +42,8 @@ final class PlaybackController: ObservableObject {
     /// 各デバイスの映像開始オフセット（音声同期のシークに使用）
     var videoStartByDevice: [String: Double] = [:]
 
-    /// video URL キャッシュ（スクラブ用音声ロードに使う）
-    private var videoURLs: [String: URL] = [:]
-
     func setup(videos: [String: URL]) {
         players = videos.mapValues { AVPlayer(url: $0) }
-        videoURLs = videos
     }
 
     func teardown() {
@@ -296,7 +51,6 @@ final class PlaybackController: ObservableObject {
         preloadedNext = nil
         players.values.forEach { $0.pause() }
         stopTimer()
-        audioScrubber.teardown()
     }
 
     // MARK: - Audio Source Sync
@@ -395,8 +149,8 @@ final class PlaybackController: ObservableObject {
             }
 
             let target = CMTimeMakeWithSeconds(srcTime, preferredTimescale: 600)
-            let useTolerant = isScrubbing || isTrimming
-            let tolerance = CMTimeMakeWithSeconds(useTolerant ? 0.05 : 0, preferredTimescale: 600)
+            let useTolerant = isTrimming
+            let tolerance = CMTimeMakeWithSeconds(useTolerant ? 0.15 : 0, preferredTimescale: 600)
             players[device]?.seek(
                 to: target,
                 toleranceBefore: tolerance,
@@ -424,113 +178,11 @@ final class PlaybackController: ObservableObject {
         }
     }
 
-    /// トリム中のスロットル付きシーク（30ms間隔で間引く）
+    /// トリム中のスロットル付きシーク（50ms間隔で間引く）
     func throttledSeekForTrim(to seconds: Double, timeline: ExclusiveEditTimeline, selectedDevice: String) {
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastTrimSeekTime >= 0.03 else { return }
+        guard now - lastTrimSeekTime >= 0.05 else { return }
         lastTrimSeekTime = now
-        seekPreview(to: seconds, timeline: timeline, selectedDevice: selectedDevice)
-    }
-
-    // MARK: - Scrub Audio (AudioEngine-based vinyl/tape style)
-
-    /// 現在スクラブに使用中のデバイス名
-    private var scrubAudioDevice: String = ""
-
-    /// スクラブ開始
-    func startScrubAudio(at seconds: Double, timeline: ExclusiveEditTimeline) {
-        isScrubbing = true
-        prevScrubSec = seconds
-        prevScrubCFTime = CFAbsoluteTimeGetCurrent()
-        scrubAudioDevice = ""
-
-        // 最初の音声ソースを特定してロード
-        loadScrubAudioIfNeeded(at: seconds, timeline: timeline)
-        audioScrubber.start()
-    }
-
-    /// スクラブ対象デバイスを特定し、必要なら AudioScrubber にロードする
-    private func loadScrubAudioIfNeeded(at seconds: Double, timeline: ExclusiveEditTimeline) {
-        let targetDevice: String
-        if let srcDevice = audioSourceDevice {
-            // 音声ソース指定あり → 常にそのデバイス
-            targetDevice = srcDevice
-        } else if let device = timeline.activeDevice(at: seconds) {
-            // 編集タイムラインに従い、現在位置のデバイスを使う
-            targetDevice = device
-        } else {
-            // セグメント外（ギャップ）→ 音声なし
-            if !scrubAudioDevice.isEmpty {
-                audioScrubber.stop()
-                scrubAudioDevice = ""
-            }
-            return
-        }
-
-        // デバイスが変わったらリロード
-        if targetDevice != scrubAudioDevice {
-            guard let url = videoURLs[targetDevice] else { return }
-            audioScrubber.loadAudio(from: url)
-            if audioScrubber.isActive {
-                // すでに start 済みなら再開
-                audioScrubber.start()
-            }
-            scrubAudioDevice = targetDevice
-        }
-    }
-
-    /// スクラブ中: ドラッグ速度からレートを算出し AudioScrubber を更新
-    func updateScrubAudio(at seconds: Double, timeline: ExclusiveEditTimeline) {
-        guard isScrubbing else { return }
-
-        // デバイス変更チェック（EDIT でセグメント境界を跨いだ場合）
-        loadScrubAudioIfNeeded(at: seconds, timeline: timeline)
-        guard !scrubAudioDevice.isEmpty else {
-            audioScrubber.update(positionInSource: 0, velocity: 0)
-            return
-        }
-
-        // ドラッグ速度（秒/秒）を算出
-        let now = CFAbsoluteTimeGetCurrent()
-        let dtWall = now - prevScrubCFTime
-        let dtTimeline = seconds - prevScrubSec
-
-        let velocity: Double
-        if dtWall > 0.001 {
-            velocity = dtTimeline / dtWall
-        } else {
-            velocity = 0
-        }
-
-        prevScrubSec = seconds
-        prevScrubCFTime = now
-
-        // ソースファイル内の時刻を算出
-        let seekTime: Double
-        if let srcDevice = audioSourceDevice,
-           let videoStart = videoStartByDevice[srcDevice] {
-            // 音声ソース指定: 録画全体の中での位置
-            seekTime = seconds - videoStart
-        } else if let seg = timeline.segments(for: scrubAudioDevice)
-            .filter({ $0.isValid })
-            .first(where: { $0.trimIn <= seconds && seconds < $0.trimOut }) {
-            // セグメント内: trimIn からのオフセットを sourceInTime に加算
-            seekTime = seg.sourceInTime + (seconds - seg.trimIn)
-        } else {
-            audioScrubber.update(positionInSource: 0, velocity: 0)
-            return
-        }
-        guard seekTime >= 0 else { return }
-
-        audioScrubber.update(positionInSource: seekTime, velocity: velocity)
-    }
-
-    /// スクラブ終了: AudioScrubber を停止し正確にシーク
-    func stopScrubAudio(at seconds: Double, timeline: ExclusiveEditTimeline, selectedDevice: String) {
-        isScrubbing = false
-        audioScrubber.stop()
-        scrubAudioDevice = ""
-        // 最終位置に正確にシーク（映像表示を合わせる）
         seekPreview(to: seconds, timeline: timeline, selectedDevice: selectedDevice)
     }
 
@@ -918,7 +570,9 @@ struct PreviewView: View {
     @State private var previousSelectedDevice: String = ""
     @State private var thumbnails: [String: [UIImage]] = [:]
     @State private var previewAspectRatio: CGFloat = 16.0 / 9.0
-    @State private var availableHeight: CGFloat = 0
+    /// setupAll 完了フラグ（false の間はローディング表示）
+    @State private var isReady: Bool = false
+
     @State private var timelineWidth: CGFloat = 1  // 後方互換のため残す（未使用）
     @State private var isPlayheadDragging: Bool = false
     @State private var showExportResult = false
@@ -978,11 +632,24 @@ struct PreviewView: View {
     @State private var scrollRequestSerial: UInt64 = 0
     /// ScrollView のコンテンツオフセット（プレイヘッド端追従用）
     @State private var scrollContentOffset: CGFloat = 0
+
     /// タイムラインの ScrollViewProxy（ピンチジェスチャーから直接スクロール制御するため）
     @State private var timelineScrollProxy: ScrollViewProxy? = nil
 
     private var sortedDevices: [String] { videos.keys.sorted() }
     private var totalDuration: Double { timeline.totalDuration }
+
+    #if DEBUG
+    /// Canvas Preview 用のダミー動画URL生成
+    static func dummyVideos(devices: [String]) -> [String: URL] {
+        var result: [String: URL] = [:]
+        for device in devices {
+            // 存在しないURLだがDictが空でなければレイアウトは確認可能
+            result[device] = URL(fileURLWithPath: "/dev/null")
+        }
+        return result
+    }
+    #endif
 
     // 全セグメントを trimIn 順に並べた再生リスト
     private func allSegmentsSorted() -> [(device: String, seg: ClipSegment)] {
@@ -1000,28 +667,47 @@ struct PreviewView: View {
                 emptyState
             } else {
                 GeometryReader { geo in
-                    let totalH = geo.size.height
-                    let headerH: CGFloat = max(56, windowSafeAreaTop + 42)
-                    let contentH = totalH - headerH
-                    let areaA = contentH * 0.4   // プレビュー（40%）
-                    let areaB = contentH * 0.6   // タイムライン+コントロール（60%）
-                    let _ = updateAvailableHeight(totalH)
+                    // .ignoresSafeArea(.top) により geo.size.height = 画面全高
+                    let _ = geo.size  // GeometryReader のサイズ取得を維持
+                    let safeTop = windowSafeAreaTop
 
                     VStack(spacing: 0) {
+                        // ステータスバー領域（背景黒 + 高さ確保）
+                        Color.clear
+                            .frame(height: safeTop)
+
                         headerBar
-                            .frame(height: headerH)
+                            .frame(height: 44)
 
+                        // プレビュー = 残りスペースを全て使う（下セクションは固有サイズ）
                         previewArea
-                            .frame(height: areaA)
+                            .frame(maxHeight: .infinity)
 
+                        // 下セクション: タイムライン + コントロール（固有サイズで詰める）
                         VStack(spacing: 0) {
                             timelineSection
                             playbackControls
                         }
-                        .frame(height: areaB)
                     }
-                    .frame(height: totalH)
                 }
+                .ignoresSafeArea(edges: .top)
+            }
+        }
+        .overlay {
+            if !isReady && !videos.isEmpty {
+                ZStack {
+                    Color.black.opacity(0.6)
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(1.2)
+                        Text("LOADING")
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(true) // 下のUIへのタッチをブロック
             }
         }
         .background(Color.black.ignoresSafeArea())
@@ -1100,77 +786,44 @@ struct PreviewView: View {
 
     // MARK: - Preview Area
 
-    /// GeometryReader の高さを State に反映する（body 内の let _ = ... で呼ぶ）
-    private func updateAvailableHeight(_ h: CGFloat) {
-        if abs(availableHeight - h) > 1 {
-            DispatchQueue.main.async { availableHeight = h }
-        }
-    }
-
-    private var previewContainerHeight: CGFloat {
-        let bounds = UIScreen.main.bounds
-        let screenW = min(bounds.width, bounds.height)
-        // アスペクト比から理想の高さ
-        let idealH = screenW / previewAspectRatio
-
-        // 他のUI要素に必要な高さを動的に計算
-        let headerH: CGFloat = 56
-        let rowH: CGFloat = 56
-        let rowCount = CGFloat(min(sortedDevices.count, 5))
-        let timelineH: CGFloat = rowCount * rowH + 3 * max(rowCount - 1, 0) + 8 + 60 + 40 // tracks + knob + scroll
-        let playbackH: CGFloat = 170  // zoom bar + play button + padding
-        let reservedForUI = headerH + timelineH + playbackH
-
-        let maxH: CGFloat
-        if availableHeight > 100 {
-            maxH = availableHeight - reservedForUI
-        } else {
-            maxH = max(bounds.width, bounds.height) * 0.35
-        }
-
-        return max(100, min(idealH, maxH))
-    }
-
     private var previewArea: some View {
-        GeometryReader { geo in
-            let boxW = min(geo.size.height * previewAspectRatio, geo.size.width)
-            let boxH = min(geo.size.width / previewAspectRatio,  geo.size.height)
+        Color.black.overlay {
+            GeometryReader { geo in
+                let boxW = min(geo.size.height * previewAspectRatio, geo.size.width)
+                let boxH = min(geo.size.width / previewAspectRatio,  geo.size.height)
 
-            ZStack {
-                Color.black
+                ZStack {
+                    ForEach(sortedDevices, id: \.self) { device in
+                        if let player = playback.players[device] {
+                            FillPlayerView(player: player)
+                                .frame(width: boxW, height: boxH)
+                                .clipped()
+                                .opacity(visibleDevice == device ? 1 : 0)
+                        }
+                    }
 
-                ForEach(sortedDevices, id: \.self) { device in
-                    if let player = playback.players[device] {
-                        FillPlayerView(player: player)
+                    // フィルタプレビュー用カラーオーバーレイ
+                    if selectedFilter == "CISepiaTone" {
+                        Color(red: 0.6, green: 0.45, blue: 0.25).opacity(0.3)
+                            .blendMode(.color)
                             .frame(width: boxW, height: boxH)
-                            .clipped()
-                            .opacity(visibleDevice == device ? 1 : 0)
+                            .allowsHitTesting(false)
+                    } else if selectedFilter == "CIPhotoEffectChrome" {
+                        Color.orange.opacity(0.06)
+                            .blendMode(.overlay)
+                            .frame(width: boxW, height: boxH)
+                            .allowsHitTesting(false)
                     }
                 }
-
-                // フィルタプレビュー用カラーオーバーレイ
-                if selectedFilter == "CISepiaTone" {
-                    Color(red: 0.6, green: 0.45, blue: 0.25).opacity(0.3)
-                        .blendMode(.color)
-                        .frame(width: boxW, height: boxH)
-                        .allowsHitTesting(false)
-                } else if selectedFilter == "CIPhotoEffectChrome" {
-                    Color.orange.opacity(0.06)
-                        .blendMode(.overlay)
-                        .frame(width: boxW, height: boxH)
-                        .allowsHitTesting(false)
-                }
+                .frame(width: boxW, height: boxH)
+                .clipped()
+                // フィルタプレビュー効果（SwiftUI モディファイアで近似）
+                .saturation(filterPreviewSaturation)
+                .contrast(filterPreviewContrast)
+                .brightness(filterPreviewBrightness)
+                .frame(width: geo.size.width, height: geo.size.height)
             }
-            .frame(width: boxW, height: boxH)
-            .clipped()
-            // フィルタプレビュー効果（SwiftUI モディファイアで近似）
-            .saturation(filterPreviewSaturation)
-            .contrast(filterPreviewContrast)
-            .brightness(filterPreviewBrightness)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black)
     }
     /// フィルタプレビュー用パラメータ
     private var filterPreviewSaturation: Double {
@@ -1267,7 +920,7 @@ struct PreviewView: View {
 
                 // 書き出しボタン
                 Button {
-                    Task { await exportEngine.export(timeline: timeline, videos: videos, orientation: desiredOrientation, audioSource: audioSource, videoFilter: selectedFilter, showWatermark: !purchaseManager.isPremium) }
+                    Task { await exportEngine.export(timeline: timeline, videos: videos, orientation: desiredOrientation, audioSource: audioSource, videoFilter: selectedFilter, showWatermark: true) }  // TestFlight: 常に透かし表示（課金実装時に !purchaseManager.isPremium に戻す）
                 } label: {
                     Image(systemName: "square.and.arrow.up")
                         .font(.system(size: 18, weight: .semibold))
@@ -1283,8 +936,6 @@ struct PreviewView: View {
             }
         }
         .padding(.horizontal, 20)
-        .padding(.top, max(14, windowSafeAreaTop))
-        .padding(.bottom, 14)
     }
 
     /// UIWindow から直接取得した top safe area inset（fullScreenCover 内でも確実）
@@ -1497,7 +1148,7 @@ struct PreviewView: View {
     private var scaledTrackWidth: CGFloat { max(trackViewportWidth * committedZoomScale, 1) }
 
     /// スクロール専用ストリップの高さ
-    private let scrollStripH: CGFloat = 40
+    private let scrollStripH: CGFloat = 16
 
     /// TimelineRow を生成するヘルパー（型チェッカー負荷軽減のため分離）
     @ViewBuilder
@@ -1575,13 +1226,14 @@ struct PreviewView: View {
 
     private var timelineSection: some View {
         let rowH: CGFloat = 56
-        let rowCount = min(sortedDevices.count, 5)
+        let rowCount = sortedDevices.count
         // トラック行の総高さ（行間スペース3pt × (rowCount-1) + 上下パディング各4pt = 8pt）
         let trackAreaH: CGFloat = CGFloat(rowCount) * rowH + 3 * CGFloat(max(rowCount - 1, 0)) + 8
-        let knobOverhang: CGFloat = knobDiameter * 2.0 + 12  // ドラッグ拡大時(2倍) + 余裕
+        let knobOverhang: CGFloat = knobDiameter + 4           // 4089比率維持のためのスペース確保
+
 
         return HStack(spacing: 0) {
-                // ① 固定ラベル列
+                // ① 固定ラベル列（3行超はオフセットでスクロール）
                 VStack(spacing: 3) {
                     ForEach(sortedDevices, id: \.self) { device in
                         let isLocked = timeline.lockedDevices.contains(device)
@@ -1625,6 +1277,7 @@ struct PreviewView: View {
                         }
                         ScrollView(.horizontal, showsIndicators: false) {
                             ZStack(alignment: .topLeading) {
+                                // トラック行（縦スクロール対応）— ノブ上配置分だけ下にオフセット
                                 VStack(spacing: 3) {
                                     ForEach(sortedDevices, id: \.self) { device in
                                         makeTimelineRow(device: device)
@@ -1650,8 +1303,9 @@ struct PreviewView: View {
                                 }
                                 .frame(height: 0)
 
-                                // 再生ヘッド：行群と同じ高さの ZStack 内に配置
+                                // 再生ヘッド：最前面に配置
                                 playheadOverlay(trackHeight: trackAreaH)
+                                    .zIndex(999)
                             }
                             // ★ レイアウト幅は committedZoomScale（ピンチ中は固定）
                             .frame(width: max(viewportW * committedZoomScale, viewportW))
@@ -1769,6 +1423,7 @@ struct PreviewView: View {
             }
             .frame(height: trackAreaH + knobOverhang + scrollStripH)
             .background(Color.white.opacity(0.04))
+
     }
 
     /// ピンチ中にプレイヘッド位置へ即座にスクロール
@@ -1822,30 +1477,33 @@ struct PreviewView: View {
         let ratio = totalDuration > 0 ? CGFloat(playback.playheadTime / totalDuration) : 0
         let lineX = scrollLeftPad + ratio * effectiveTrackWidth
         let knobBase = knobDiameter
-        // ★ ドラッグ中は赤丸を2倍に拡大（24pt → 48pt）
+        // ★ ドラッグ中は赤丸を2.0倍に拡大（24pt → 48pt）＋ 上に浮かせる
         let knob: CGFloat = isPlayheadDragging ? knobBase * 2.0 : knobBase
+        let knobLift: CGFloat = isPlayheadDragging ? 20.0 : 0  // ドラッグ中だけ20pt上にひょいっと
 
         // ★ 親の scaleEffect(x:) の影響で赤丸・縦ラインが横に引き伸ばされるのを防ぐ逆スケール
         let currentScaleX: CGFloat = isPinching ? zoomScale / committedZoomScale : 1.0
         let inverseX: CGFloat = currentScaleX > 0.01 ? 1.0 / currentScaleX : 1.0
         
         return ZStack(alignment: .topLeading) {
-            // ── 縦ライン（トラック上端 y:0 からノブ中心まで）──
+            // ── 縦ライン（トラック上端からトラック下端まで）──
             Rectangle()
                 .fill(Color.red)
-                .frame(width: isPlayheadDragging ? 3 : 2, height: trackHeight + knob / 2)
+                .frame(width: isPlayheadDragging ? 3 : 2, height: trackHeight)
                 .scaleEffect(x: inverseX, y: 1.0)
                 .offset(x: lineX - 1, y: 0)
                 .allowsHitTesting(false)
                 .id("playhead-anchor")
 
-            // ── ●ドラッグハンドル（トラック直下に配置、ドラッグ中は拡大）──
+            // ── ●ドラッグハンドル ──
+            // 通常: ノブ上端 = トラック下端（トラック直下にぶら下がる）
+            // ドラッグ中: 2倍拡大 + 上に浮かせる
             Circle()
                 .fill(Color.red)
                 .frame(width: knob, height: knob)
                 .scaleEffect(x: inverseX, y: 1.0)
                 .shadow(color: isPlayheadDragging ? Color.red.opacity(0.5) : .clear, radius: 6)
-                .offset(x: lineX - knob / 2, y: trackHeight)
+                .offset(x: lineX - knob / 2, y: trackHeight - knobLift)
                 .animation(.spring(response: 0.2, dampingFraction: 0.7), value: isPlayheadDragging)
                 .gesture(
                     DragGesture(minimumDistance: 0)
@@ -1856,23 +1514,20 @@ struct PreviewView: View {
                             let r = max(0, min(1, CGFloat(startRatio) + deltaRatio))
                             let sec = Double(r) * totalDuration
                             if !isPlayheadDragging {
-                                // ドラッグ開始
                                 isPlayheadDragging = true
-                                playback.startScrubAudio(at: sec, timeline: timeline)
                             }
                             playback.playheadTime = sec
                             playback.seekPreview(to: sec, timeline: timeline, selectedDevice: selectedDevice)
-                            playback.updateScrubAudio(at: sec, timeline: timeline)
                         }
                         .onEnded { _ in
                             let sec = playback.playheadTime
                             isPlayheadDragging = false
-                            playback.stopScrubAudio(at: sec, timeline: timeline, selectedDevice: selectedDevice)
+                            playback.seekPreview(to: sec, timeline: timeline, selectedDevice: selectedDevice)
                         }
                 )
         }
-        // ZStack のフレームをトラック行全体 + ノブ分（拡大時を含む）に明示固定
-        .frame(height: trackHeight + knobBase * 2.0 + 4, alignment: .topLeading)
+        // ZStack のフレーム = トラック高さ + ノブがはみ出る分
+        .frame(height: trackHeight + knobBase + 4, alignment: .topLeading)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -1928,8 +1583,8 @@ struct PreviewView: View {
                 videoFilterSheet
             }
         }
-        .padding(.bottom, 32)
-        .padding(.top, 8)
+        .padding(.bottom, 16)
+        .padding(.top, 4)
     }
 
     // MARK: - Audio Source Sheet
@@ -2399,15 +2054,14 @@ struct PreviewView: View {
             }
         }
 
-        // サムネイル取得 + アスペクト比設定
-        await generateAllThumbnails()
-        previewAspectRatio = desiredOrientation.aspectRatio
+        // アスペクト比はすぐ設定（サムネイルより先にレイアウトを確定）
+        await MainActor.run { previewAspectRatio = desiredOrientation.aspectRatio }
 
-        // スクラブ用音声を事前ロード（最初のデバイスまたは音声ソースデバイス）
-        let scrubDevice = playback.audioSourceDevice ?? playback.activePreviewDevice
-        if let url = videos[scrubDevice] {
-            playback.audioScrubber.loadAudio(from: url)
-        }
+        // サムネイル取得（バックグラウンドで実行）
+        await generateAllThumbnails()
+
+        // 準備完了
+        await MainActor.run { isReady = true }
     }
 
     // MARK: - Playback Logic（seekPreview / toggle / seekToSegment は PlaybackController へ移譲済み）
@@ -2604,8 +2258,7 @@ private struct TimelineRow: View {
     }
 
     // MARK: ② 使用範囲だけ明るくくり抜く
-    // UIGraphicsImageRenderer でサムネイルを合成 → CGImage.cropping でクリップ
-    // SwiftUI の mask/offset の座標系に依存しないため位置ズレが起きない
+    // SwiftUI の offset + clip で表示。UIGraphicsImageRenderer を使わないため軽量。
 
     @ViewBuilder
     private func activeThumbnailClip(
@@ -2620,77 +2273,37 @@ private struct TimelineRow: View {
             let outX    = seg.trimOutRatio(total: totalDuration) * width
             let clipW   = max(outX - inX, 0)
 
-            // ① サムネイルストリップ全体を UIImage として合成
-            let full = renderThumbnailStrip(
-                totalWidth: width, height: thumbHeight,
-                vStartX: vStartX, vWidth: vWidth
-            )
-            // ② inX〜outX の範囲だけ切り出して表示
-            if let cropped = cropImage(full, fromX: inX, width: clipW, height: thumbHeight) {
-                HStack(spacing: 0) {
-                    Color.clear.frame(width: inX, height: thumbHeight)
-                    ZStack {
-                        Image(uiImage: cropped)
-                            .resizable()
+            HStack(spacing: 0) {
+                Color.clear.frame(width: inX, height: thumbHeight)
+                ZStack {
+                    // サムネイルストリップを offset で配置し、clipW の窓でクリップ
+                    thumbnailContent(width: vWidth)
+                        .frame(width: vWidth, height: thumbHeight)
+                        .offset(x: vStartX - inX)
+                        .frame(width: clipW, height: thumbHeight, alignment: .leading)
+                        .clipped()
+
+                    // 選択中セグメントに枠を表示（ロック時は深いブルー）
+                    if showBlueBorder && clipW > 0 {
+                        RoundedRectangle(cornerRadius: 2)
+                            .stroke(segmentColor, lineWidth: 2)
                             .frame(width: clipW, height: thumbHeight)
-                            .clipped()
-
-                        // 選択中セグメントに枠を表示（ロック時は深いブルー）
-                        if showBlueBorder && clipW > 0 {
-                            RoundedRectangle(cornerRadius: 2)
-                                .stroke(segmentColor, lineWidth: 2)
-                                .frame(width: clipW, height: thumbHeight)
-                        }
                     }
-                    .frame(width: clipW, height: thumbHeight)
-                    // 青枠エリアをタップ → このセグメントを編集対象に選択
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        print("[TIMELINE] segmentTap: \(seg.id) device=\(deviceName)")
-                        onSegmentTap?(seg.id)
-                    }
-                    // 編集中セグメントはトリムハンドルにタッチを譲る
-                    .allowsHitTesting(seg.id != editingSegmentID)
-                    Spacer(minLength: 0)
                 }
-                .frame(width: width, height: thumbHeight)
-                .allowsHitTesting(onSegmentTap != nil && !isLocked)
-            }
-        }
-    }
-
-    /// サムネイルを横に並べた UIImage を生成（totalWidth × height のキャンバス上に vStartX から配置）
-    private func renderThumbnailStrip(
-        totalWidth: CGFloat, height: CGFloat,
-        vStartX: CGFloat, vWidth: CGFloat
-    ) -> UIImage {
-        let renderer = UIGraphicsImageRenderer(
-            size: CGSize(width: max(totalWidth, 1), height: max(height, 1))
-        )
-        return renderer.image { _ in
-            if thumbnails.isEmpty {
-                UIColor.white.withAlphaComponent(0.15).setFill()
-                UIRectFill(CGRect(x: vStartX, y: 0, width: vWidth, height: height))
-            } else {
-                let tw = vWidth / CGFloat(thumbnails.count)
-                for (i, img) in thumbnails.enumerated() {
-                    let rect = CGRect(x: vStartX + tw * CGFloat(i), y: 0,
-                                      width: tw, height: height)
-                    img.draw(in: rect)
+                .frame(width: clipW, height: thumbHeight)
+                // 青枠エリアをタップ → このセグメントを編集対象に選択
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    print("[TIMELINE] segmentTap: \(seg.id) device=\(deviceName)")
+                    onSegmentTap?(seg.id)
                 }
+                // 編集中セグメントはトリムハンドルにタッチを譲る
+                .allowsHitTesting(seg.id != editingSegmentID)
+                Spacer(minLength: 0)
             }
+            .frame(width: width, height: thumbHeight)
+            .allowsHitTesting(onSegmentTap != nil && !isLocked)
         }
-    }
-
-    /// UIImage の x 位置から指定幅で切り出す
-    private func cropImage(
-        _ image: UIImage, fromX: CGFloat, width: CGFloat, height: CGFloat
-    ) -> UIImage? {
-        guard width > 0, height > 0 else { return nil }
-        let s = image.scale
-        let cropRect = CGRect(x: fromX * s, y: 0, width: width * s, height: height * s)
-        guard let cg = image.cgImage?.cropping(to: cropRect) else { return nil }
-        return UIImage(cgImage: cg, scale: s, orientation: image.imageOrientation)
     }
 
     // MARK: ③ トリムハンドル（両端のみ、固定幅バー）
@@ -2939,4 +2552,35 @@ private extension Comparable {
         min(max(self, range.lowerBound), range.upperBound)
     }
 }
+
+// MARK: - Canvas Preview
+
+#if DEBUG
+#Preview("Cinema 2.39:1 - 2 devices") {
+    PreviewView(
+        sessionID: "preview-cinema",
+        videos: PreviewView.dummyVideos(devices: ["あいぱ", "節子みに"]),
+        sessionTitle: "UNTITLED",
+        desiredOrientation: .cinema
+    )
+}
+
+#Preview("TV 16:9 - 3 devices") {
+    PreviewView(
+        sessionID: "preview-tv",
+        videos: PreviewView.dummyVideos(devices: ["iPhone 15", "iPad Pro", "GoPro"]),
+        sessionTitle: "TV SHOOT",
+        desiredOrientation: .landscape
+    )
+}
+
+#Preview("Portrait 9:16 - 1 device") {
+    PreviewView(
+        sessionID: "preview-portrait",
+        videos: PreviewView.dummyVideos(devices: ["iPhone 15"]),
+        sessionTitle: "VERTICAL",
+        desiredOrientation: .portrait
+    )
+}
+#endif
 

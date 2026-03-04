@@ -267,23 +267,29 @@ final class ExportEngine: ObservableObject {
         let needsCIHandler = videoFilter != nil || showWatermark
 
         if needsCIHandler {
-            // CIFilter ハンドラーで transform + フィルタ + 透かしを一括処理
-            let capturedRanges = clipRanges
-            let capturedTransforms = transformCache
+            // CIFilter ハンドラーで フィルタ + 透かしを処理
+            // ★ AVVideoComposition(asset:) は sourceImage に preferredTransform を適用済み。
+            //   ここではスケール＋クロップ（renderSize へのフィット）とフィルタ適用のみ行う。
             let size = renderSize
             let watermarkImage = showWatermark ? Self.renderWatermarkCIImage(size: size) : nil
 
             finalVideoComp = AVVideoComposition(asset: composition) { request in
                 var image = request.sourceImage.clampedToExtent()
 
-                // 現在の時刻に対応するクリップの transform を適用
-                let timeSec = CMTimeGetSeconds(request.compositionTime)
-                if let range = capturedRanges.first(where: {
-                    let start = CMTimeGetSeconds($0.compositionStart)
-                    let dur = CMTimeGetSeconds($0.duration)
-                    return timeSec >= start && timeSec < start + dur + 0.01
-                }), let transform = capturedTransforms[range.url] {
-                    image = image.transformed(by: transform)
+                // sourceImage の実サイズ（preferredTransform 適用済み）→ renderSize にカバースケール＋センタークロップ
+                let srcExtent = request.sourceImage.extent
+                if srcExtent.width > 0 && srcExtent.height > 0
+                    && (abs(srcExtent.width - size.width) > 1 || abs(srcExtent.height - size.height) > 1) {
+                    let scaleX = size.width / srcExtent.width
+                    let scaleY = size.height / srcExtent.height
+                    let scale = max(scaleX, scaleY) // cover
+                    let scaledW = srcExtent.width * scale
+                    let scaledH = srcExtent.height * scale
+                    let tx = (size.width - scaledW) / 2.0 - srcExtent.origin.x * scale
+                    let ty = (size.height - scaledH) / 2.0 - srcExtent.origin.y * scale
+                    let fitTransform = CGAffineTransform(scaleX: scale, y: scale)
+                        .concatenating(CGAffineTransform(translationX: tx, y: ty))
+                    image = image.transformed(by: fitTransform)
                 }
 
                 // renderSize でクロップ
@@ -446,24 +452,30 @@ final class ExportEngine: ObservableObject {
 
     // MARK: - Watermark
 
-    /// 透かし用の CIImage を生成（右下に「Cinecam」テキスト）
+    /// 透かし用の CIImage を生成（右下に「CINECAM.」ロゴテキスト）
+    /// 接続画面と同じフォントスタイル（black weight, compressed width）を使用
     /// renderSize に合わせてフォントサイズを自動調整する
     private static func renderWatermarkCIImage(size: CGSize) -> CIImage? {
-        let fontSize = max(size.width * 0.035, 20)
-        let margin = size.width * 0.03
-        let text = "Cinecam"
+        let fontSize = max(size.width * 0.03, 16)
+        let margin = size.width * 0.025
 
-        // UIKit でテキストを描画して CIImage に変換
+        // 接続画面と同じ compressed black フォント
+        let fontDescriptor = UIFont.systemFont(ofSize: fontSize, weight: .black).fontDescriptor
+            .withDesign(.default)!
+            .withSymbolicTraits(.traitCondensed)!
+        let font = UIFont(descriptor: fontDescriptor, size: fontSize)
+
+        let text = "CINECAM."
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: fontSize, weight: .bold),
-            .foregroundColor: UIColor.white.withAlphaComponent(0.6),
+            .font: font,
+            .foregroundColor: UIColor.white.withAlphaComponent(0.5),
+            .kern: -0.5 as NSNumber,
         ]
         let textSize = (text as NSString).size(withAttributes: attributes)
 
         // 影付きでテキストを描画
         let renderer = UIGraphicsImageRenderer(size: size)
         let uiImage = renderer.image { ctx in
-            // 背景は透明
             let context = ctx.cgContext
 
             // 影を設定
@@ -475,7 +487,6 @@ final class ExportEngine: ObservableObject {
 
             // テキスト位置（右下、マージン付き）
             let x = size.width - textSize.width - margin
-            // UIKit 座標系（左上原点）で描画 → CIImage 変換で上下反転 → 右下に表示
             let drawY = size.height - textSize.height - margin
             (text as NSString).draw(
                 at: CGPoint(x: x, y: drawY),
