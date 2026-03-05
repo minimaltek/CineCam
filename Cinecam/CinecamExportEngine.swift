@@ -158,7 +158,6 @@ final class ExportEngine: ObservableObject {
         }
 
         // ③-b 音声トラックを構築
-        let totalCompositionDuration = cursor
         if let audioDevice = audioSource, let audioURL = videos[audioDevice] {
             // 特定デバイスの音声を使用: 各クリップの区間に対応する音声を挿入
             let audioAsset = AVURLAsset(url: audioURL)

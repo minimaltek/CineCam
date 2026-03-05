@@ -352,9 +352,7 @@ class CameraSessionManager: NSObject, ObservableObject {
             if !alreadyReceived && totalExpectedFiles > 0 {
                 totalExpectedFiles = max(totalExpectedFiles - 1, receivedFiles)
                 addLog("Transfer: adjusted expected from disconnected peer \(peerName) → \(receivedFiles)/\(totalExpectedFiles)")
-                if let sid = previewSessionID ?? (recordedVideos.keys.first) {
-                    sessionExpectedCounts[sid] = totalExpectedFiles
-                }
+                sessionExpectedCounts[sid] = totalExpectedFiles
                 // 調整後に全ファイル揃っているか再チェック
                 checkAllVideosReceived(sessionID: sid)
             }
