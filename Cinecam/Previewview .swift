@@ -618,6 +618,23 @@ struct PreviewView: View {
         ("SEPIA",  "paintpalette",    "CISepiaTone"),
     ]
 
+    // MARK: - Pitch Shift
+    /// ピッチシフト値（セント単位: 0 = 変更なし, 1200 = +1オクターブ, -1200 = -1オクターブ）
+    @State private var pitchShiftCents: Float = 0
+    /// ピッチシフト選択シート表示フラグ
+    @State private var showPitchShiftSheet: Bool = false
+
+    /// ピッチプリセット定義（表示名, セント値）
+    private static let pitchPresets: [(label: String, cents: Float)] = [
+        ("+2 OCT",  +2400),
+        ("+1 OCT",  +1200),
+        ("+5 st",    +500),
+        ("NORMAL",       0),
+        ("−5 st",    -500),
+        ("−1 OCT",  -1200),
+        ("−2 OCT",  -2400),
+    ]
+
     // MARK: - Timeline Zoom
     /// タイムラインのズーム倍率（1.0 = 全体表示、最大 8.0）
     @State private var zoomScale: CGFloat = 1.0
@@ -1069,6 +1086,7 @@ struct PreviewView: View {
             Button {
                 timeline.toggleLock(for: device)
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                lockPopoverDevice = nil
             } label: {
                 HStack(spacing: 10) {
                     Image(systemName: isLocked ? "checkmark.square.fill" : "square")
@@ -1086,22 +1104,11 @@ struct PreviewView: View {
             }
             .padding(.horizontal, 24)
 
-            Button("Close") {
-                lockPopoverDevice = nil
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-            .background(Color.white.opacity(0.1))
-            .foregroundColor(.white.opacity(0.7))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .padding(.horizontal, 24)
-            .padding(.top, 16)
-
             Spacer()
         }
         .frame(maxWidth: .infinity)
         .background(Color(white: 0.1).ignoresSafeArea())
-        .presentationDetents([.height(220)])
+        .presentationDetents([.height(180)])
         .presentationDragIndicator(.hidden)
     }
 
@@ -1224,12 +1231,6 @@ struct PreviewView: View {
                     playback.playheadTime = seg.trimIn
                     playback.seekPreview(to: seg.trimIn, timeline: timeline, selectedDevice: device)
                 }
-            },
-            onDeleteSegment: { segID in
-                print("[PARENT] onDeleteSegment device=\(device) seg=\(segID)")
-                timeline.removeSegment(segmentID: segID, device: device)
-                editingSegmentIDs.removeValue(forKey: device)
-                editingDevices.remove(device)
             },
             onTrimEnd: {
                 playback.isTrimming = false
@@ -1552,8 +1553,17 @@ struct PreviewView: View {
             // ── ズームバー ──────────────────────────────────────
             zoomBar
 
-            // ── 再生ボタン + 音声ソース ──────────────────────────
+            // ── 再生ボタン + 音声ソース + ピッチ ──────────────────
             HStack(spacing: 24) {
+                // ピッチシフト選択ボタン（マイクアイコン）
+                Button {
+                    showPitchShiftSheet = true
+                } label: {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundColor(pitchShiftCents != 0 ? .cyan : .white.opacity(0.6))
+                }
+
                 // 音声ソース選択ボタン（ヘッドフォンアイコン）
                 Button {
                     showAudioSourceSheet = true
@@ -1590,6 +1600,9 @@ struct PreviewView: View {
                         .foregroundColor(selectedFilter != nil ? .cyan : .white.opacity(0.6))
                 }
             }
+            .sheet(isPresented: $showPitchShiftSheet) {
+                pitchShiftSheet
+            }
             .sheet(isPresented: $showAudioSourceSheet) {
                 audioSourceSheet
             }
@@ -1599,6 +1612,47 @@ struct PreviewView: View {
         }
         .padding(.bottom, 16)
         .padding(.top, 4)
+    }
+
+    // MARK: - Pitch Shift Sheet
+
+    private var pitchShiftSheet: some View {
+        NavigationView {
+            List {
+                ForEach(Self.pitchPresets, id: \.cents) { preset in
+                    Button {
+                        pitchShiftCents = preset.cents
+                        showPitchShiftSheet = false
+                    } label: {
+                        HStack {
+                            Image(systemName: preset.cents > 0 ? "arrow.up" : preset.cents < 0 ? "arrow.down" : "equal")
+                                .foregroundColor(.white)
+                                .frame(width: 28)
+                            Text(preset.label)
+                                .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                .foregroundColor(.white)
+                            Spacer()
+                            if pitchShiftCents == preset.cents {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.cyan)
+                            }
+                        }
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(Color(white: 0.1))
+            .navigationTitle("PITCH SHIFT")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { showPitchShiftSheet = false }
+                        .foregroundColor(.cyan)
+                }
+            }
+        }
+        .presentationDetents([.height(420)])
+        .presentationDragIndicator(.visible)
     }
 
     // MARK: - Audio Source Sheet
@@ -2146,8 +2200,7 @@ private struct TimelineRow: View {
     let onTap: () -> Void
     /// セグメントの青枠をタップしたときに、そのセグメントIDを通知する
     var onSegmentTap: ((UUID) -> Void)? = nil
-    /// トリムハンドルのダブルタップでセグメントを削除する
-    var onDeleteSegment: ((UUID) -> Void)? = nil
+
     /// トリムドラッグ終了時のコールバック
     var onTrimEnd: (() -> Void)? = nil
 
@@ -2159,8 +2212,8 @@ private struct TimelineRow: View {
     private let thumbHeight: CGFloat = 52
     private let handleWidth: CGFloat = 16
 
-    /// セグメントの枠色（ロック時は深いブルー）
-    private var segmentColor: Color { isLocked ? Color(red: 0.1, green: 0.25, blue: 0.7) : trimHandleColor }
+    /// セグメントの枠色（ロック時は濃いめのグレー）
+    private var segmentColor: Color { isLocked ? Color(white: 0.35) : trimHandleColor }
     /// トリムハンドル用の色（Photos風イエロー）
     private let trimHandleColor: Color = Color(red: 1.0, green: 0.82, blue: 0.0)
 
@@ -2338,61 +2391,40 @@ private struct TimelineRow: View {
         if totalDuration > 0, width > 0 {
             let inX      = seg.trimInRatio(total: totalDuration)  * width
             let outX     = seg.trimOutRatio(total: totalDuration) * width
-            let rangeW   = max(outX - inX, 0)
-            let isDragging = draggingID == seg.id
-
             ZStack(alignment: .topLeading) {
                 // 上下ボーダー：常時表示（選択中を示す）
                 // ボーダーの線幅が scaleEffect で伸びるのを防ぐため、逆スケール補正した lineWidth を使用
-                let borderW: CGFloat = (isDragging ? 3 : 2.5) * inverseScaleX
+                let borderW: CGFloat = 2.5 * inverseScaleX
                 Path { path in
                     path.move(to: CGPoint(x: inX, y: 0))
                     path.addLine(to: CGPoint(x: outX, y: 0))
                     path.move(to: CGPoint(x: inX, y: thumbHeight))
                     path.addLine(to: CGPoint(x: outX, y: thumbHeight))
                 }
-                .stroke(isDragging ? Color.red : trimHandleColor.opacity(0.9), lineWidth: borderW)
+                .stroke(trimHandleColor.opacity(0.9), lineWidth: borderW)
                 .allowsHitTesting(false)
 
                 // IN点ハンドル：右端を inX に合わせる
-                handleBar(isLeading: true, isDragging: isDragging)
+                handleBar(isLeading: true)
                     .frame(width: handleWidth, height: thumbHeight)
                     .scaleEffect(x: inverseScaleX, y: 1.0)
                     .padding(.horizontal, 20)  // タッチ領域拡大
                     .offset(x: inX - handleWidth - 20)
-                    .onTapGesture(count: 2) {
-                        onDeleteSegment?(seg.id)
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    }
                     .gesture(inHandleGesture(seg: seg, width: width))
 
                 // OUT点ハンドル：左端を outX に合わせる
-                handleBar(isLeading: false, isDragging: isDragging)
+                handleBar(isLeading: false)
                     .frame(width: handleWidth, height: thumbHeight)
                     .scaleEffect(x: inverseScaleX, y: 1.0)
                     .padding(.horizontal, 20)  // タッチ領域拡大
                     .offset(x: outX - 20)
-                    .onTapGesture(count: 2) {
-                        onDeleteSegment?(seg.id)
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    }
                     .gesture(outHandleGesture(seg: seg, width: width))
 
-                // 中央エリア：ダブルタップで削除のみ
-                if rangeW > 0 {
-                    Color.clear
-                        .frame(width: rangeW, height: thumbHeight)
-                        .offset(x: inX)
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) {
-                            onDeleteSegment?(seg.id)
-                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        }
-                }
+
 
                 // IN点の縦線
                 Rectangle()
-                    .fill(isDragging ? Color.red : trimHandleColor)
+                    .fill(trimHandleColor)
                     .frame(width: 1, height: thumbHeight)
                     .scaleEffect(x: inverseScaleX, y: 1.0)
                     .offset(x: inX)
@@ -2400,7 +2432,7 @@ private struct TimelineRow: View {
 
                 // OUT点の縦線
                 Rectangle()
-                    .fill(isDragging ? Color.red : trimHandleColor)
+                    .fill(trimHandleColor)
                     .frame(width: 1, height: thumbHeight)
                     .scaleEffect(x: inverseScaleX, y: 1.0)
                     .offset(x: outX - 1)
@@ -2410,10 +2442,10 @@ private struct TimelineRow: View {
         }
     }
 
-    /// Photos風ハンドルバー：黄色塗り + シェブロン（ドラッグ中は赤系に変化）
-    private func handleBar(isLeading: Bool, isDragging: Bool = false) -> some View {
-        let bgColor = isDragging ? Color.red : trimHandleColor
-        let chevronColor: Color = isDragging ? .white : .black.opacity(0.4)
+    /// Photos風ハンドルバー：黄色塗り + シェブロン
+    private func handleBar(isLeading: Bool) -> some View {
+        let bgColor = trimHandleColor
+        let chevronColor: Color = .black.opacity(0.4)
         return RoundedRectangle(cornerRadius: 4)
             .fill(bgColor)
             .overlay(
