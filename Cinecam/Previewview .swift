@@ -1553,34 +1553,34 @@ struct PreviewView: View {
             // ── ズームバー ──────────────────────────────────────
             zoomBar
 
-            // ── 再生ボタン + 音声ソース + ピッチ ──────────────────
-            HStack(spacing: 24) {
-                // ピッチシフト選択ボタン（マイクアイコン）
-                Button {
-                    showPitchShiftSheet = true
-                } label: {
-                    Image(systemName: "mic.fill")
-                        .font(.system(size: 24, weight: .medium))
-                        .foregroundColor(pitchShiftCents != 0 ? .cyan : .white.opacity(0.6))
+            // ── 再生ボタン（中央固定）+ 左右均等配置 ──────────────
+            HStack(spacing: 0) {
+                // 左グループ：ピッチ + 音声ソース
+                HStack(spacing: 20) {
+                    Button {
+                        showPitchShiftSheet = true
+                    } label: {
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundColor(pitchShiftCents != 0 ? .cyan : .white.opacity(0.6))
+                    }
+                    Button {
+                        showAudioSourceSheet = true
+                    } label: {
+                        Image(systemName: "headphones")
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundColor(audioSource != nil ? .cyan : .white.opacity(0.6))
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .trailing)
 
-                // 音声ソース選択ボタン（ヘッドフォンアイコン）
-                Button {
-                    showAudioSourceSheet = true
-                } label: {
-                    Image(systemName: "headphones")
-                        .font(.system(size: 24, weight: .medium))
-                        .foregroundColor(audioSource != nil ? .cyan : .white.opacity(0.6))
-                }
-
-                // 再生ボタン
+                // 再生ボタン（常に中央）
                 Button(action: {
                     if !playback.isPlaying {
                         editingDevices.removeAll()
                         editingSegmentIDs.removeAll()
                     }
                     playback.togglePlayback(allSegments: allSegmentsSorted(), totalDuration: totalDuration)
-                    // 音声ソース: 再生開始時に同期開始、停止時にpause
                     if playback.isPlaying {
                         playback.startAudioSource(playheadTime: playback.playheadTime)
                     } else {
@@ -1590,15 +1590,19 @@ struct PreviewView: View {
                     Image(systemName: playback.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                         .font(.system(size: 64)).foregroundColor(.white)
                 }
+                .padding(.horizontal, 24)
 
-                // 映像フィルタ選択ボタン
-                Button {
-                    showFilterSheet = true
-                } label: {
-                    Image(systemName: "camera.filters")
-                        .font(.system(size: 24, weight: .medium))
-                        .foregroundColor(selectedFilter != nil ? .cyan : .white.opacity(0.6))
+                // 右グループ：フィルタ（左グループと同幅にして中央を維持）
+                HStack(spacing: 20) {
+                    Button {
+                        showFilterSheet = true
+                    } label: {
+                        Image(systemName: "camera.filters")
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundColor(selectedFilter != nil ? .cyan : .white.opacity(0.6))
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .sheet(isPresented: $showPitchShiftSheet) {
                 pitchShiftSheet
