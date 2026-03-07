@@ -794,8 +794,10 @@ struct PreviewView: View {
     // MARK: - Audio Source
     /// 音声ソース: nil = 編集に従う（カット毎に切替）、"デバイス名" = そのデバイスの音を常に使用
     @State private var audioSource: String? = nil
-    /// 音声ソース選択シート表示フラグ
-    @State private var showAudioSourceSheet: Bool = false
+    /// 音声設定シート表示フラグ（SOURCE / PITCH 統合）
+    @State private var showAudioSheet: Bool = false
+    /// 音声設定シートのタブ（0=SOURCE, 1=PITCH）
+    @State private var audioSheetTab: Int = 0
 
     // MARK: - Device Lock
     /// ロックパネル表示中のデバイス名（nil = 非表示）
@@ -818,8 +820,7 @@ struct PreviewView: View {
     // MARK: - Pitch Shift
     /// ピッチシフト値（セント単位: 0 = 変更なし, 1200 = +1オクターブ, -1200 = -1オクターブ）
     @State private var pitchShiftCents: Float = 0
-    /// ピッチシフト選択シート表示フラグ
-    @State private var showPitchShiftSheet: Bool = false
+    
 
     /// ピッチプリセット定義（表示名, セント値）
     private static let pitchPresets: [(label: String, cents: Float)] = [
@@ -1267,16 +1268,13 @@ struct PreviewView: View {
         }
         .frame(maxWidth: .infinity)
         .background(Color(white: 0.1).ignoresSafeArea())
-        .presentationDetents([.height(260)])
+        .presentationDetents([.medium])
         .presentationDragIndicator(.hidden)
+        .interactiveDismissDisabled()
         .onAppear {
-            // シートのスライドアニメーション（約0.4秒）が完了してから
-            // フォーカスを当てる。早すぎるとシートが見えない状態でキーボードが
-            // 開き、アニメーション中の画面タッチが誤入力される。
-            // また titleDraft をここで再セットすることで、isEditingTitle = true と
-            // State 更新が非同期で競合しても正しい値が確保される。
             titleDraft = currentTitle == "UNTITLED" ? "" : currentTitle
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+            // シートの表示アニメーション完了後にキーボードを表示
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                 titleFieldFocused = true
             }
         }
@@ -1775,7 +1773,7 @@ struct PreviewView: View {
 
             // ── 再生ボタン（中央固定）+ 左右均等配置 ──────────────
             HStack(spacing: 0) {
-                // 左グループ：ピッチ + 音声ソース
+                // 左グループ：音声設定（ソース + ピッチ統合）
                 HStack(spacing: 20) {
                     Button {
                         // 再生中なら停止してからシートを開く
@@ -1784,18 +1782,11 @@ struct PreviewView: View {
                             playback.pauseAudioSource()
                             playback.pitchEnginePause()
                         }
-                        showPitchShiftSheet = true
-                    } label: {
-                        Image(systemName: "mic.fill")
-                            .font(.system(size: 24, weight: .medium))
-                            .foregroundColor(pitchShiftCents != 0 ? .cyan : .white.opacity(0.6))
-                    }
-                    Button {
-                        showAudioSourceSheet = true
+                        showAudioSheet = true
                     } label: {
                         Image(systemName: "headphones")
                             .font(.system(size: 24, weight: .medium))
-                            .foregroundColor(audioSource != nil ? .cyan : .white.opacity(0.6))
+                            .foregroundColor((audioSource != nil || pitchShiftCents != 0) ? .cyan : .white.opacity(0.6))
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .trailing)
@@ -1832,11 +1823,8 @@ struct PreviewView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .sheet(isPresented: $showPitchShiftSheet) {
-                pitchShiftSheet
-            }
-            .sheet(isPresented: $showAudioSourceSheet) {
-                audioSourceSheet
+            .sheet(isPresented: $showAudioSheet) {
+                audioSheet
             }
             .sheet(isPresented: $showFilterSheet) {
                 videoFilterSheet
@@ -1846,113 +1834,110 @@ struct PreviewView: View {
         .padding(.top, 4)
     }
 
-    // MARK: - Pitch Shift Sheet
+    // MARK: - Audio Sheet (SOURCE + PITCH 統合)
 
-    private var pitchShiftSheet: some View {
+    private var audioSheet: some View {
         NavigationView {
-            List {
-                ForEach(Self.pitchPresets, id: \.cents) { preset in
-                    Button {
-                        pitchShiftCents = preset.cents
-                        applyPitchShift()
-                        // ピッチ選択時に即座に音声抽出を開始（シート閉じるアニメーション中に抽出進行）
-                        if preset.cents != 0 {
-                            for (device, url) in videos {
-                                playback.extractAudioIfNeeded(device: device, videoURL: url) { _ in }
+            VStack(spacing: 0) {
+                // タブ切り替え
+                Picker("", selection: $audioSheetTab) {
+                    Text("SOURCE").tag(0)
+                    Text("PITCH").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
+
+                if audioSheetTab == 0 {
+                    // ── SOURCE タブ ──
+                    List {
+                        Button {
+                            audioSource = nil
+                            applyAudioSource()
+                        } label: {
+                            HStack {
+                                Image(systemName: "film")
+                                    .foregroundColor(.white)
+                                    .frame(width: 28)
+                                Text("FOLLOW EDIT")
+                                    .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                    .foregroundColor(.white)
+                                Spacer()
+                                if audioSource == nil {
+                                    Image(systemName: "checkmark")
+                                        .foregroundColor(.cyan)
+                                }
                             }
                         }
-                        showPitchShiftSheet = false
-                    } label: {
-                        HStack {
-                            Image(systemName: preset.cents > 0 ? "arrow.up" : preset.cents < 0 ? "arrow.down" : "equal")
-                                .foregroundColor(.white)
-                                .frame(width: 28)
-                            Text(preset.label)
-                                .font(.system(size: 14, weight: .medium, design: .monospaced))
-                                .foregroundColor(.white)
-                            Spacer()
-                            if pitchShiftCents == preset.cents {
-                                Image(systemName: "checkmark")
-                                    .foregroundColor(.cyan)
+                        .listRowBackground(Color.white.opacity(0.08))
+
+                        ForEach(sortedDevices, id: \.self) { device in
+                            Button {
+                                audioSource = device
+                                applyAudioSource()
+                            } label: {
+                                HStack {
+                                    Image(systemName: "mic.fill")
+                                        .foregroundColor(.white)
+                                        .frame(width: 28)
+                                    Text(device)
+                                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                        .foregroundColor(.white)
+                                    Spacer()
+                                    if audioSource == device {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.cyan)
+                                    }
+                                }
                             }
+                            .listRowBackground(Color.white.opacity(0.08))
                         }
                     }
-                }
-            }
-            .scrollContentBackground(.hidden)
-            .background(Color(white: 0.1))
-            .navigationTitle("PITCH SHIFT")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { showPitchShiftSheet = false }
-                        .foregroundColor(.cyan)
-                }
-            }
-        }
-        .presentationDetents([.height(420)])
-        .presentationDragIndicator(.visible)
-    }
-
-    // MARK: - Audio Source Sheet
-
-    private var audioSourceSheet: some View {
-        NavigationView {
-            List {
-                // "Follow Edit" = use audio from the same device as the video cut
-                Button {
-                    audioSource = nil
-                    applyAudioSource()
-                    showAudioSourceSheet = false
-                } label: {
-                    HStack {
-                        Image(systemName: "film")
-                            .foregroundColor(.white)
-                            .frame(width: 28)
-                        Text("FOLLOW EDIT")
-                            .font(.system(size: 14, weight: .medium, design: .monospaced))
-                            .foregroundColor(.white)
-                        Spacer()
-                        if audioSource == nil {
-                            Image(systemName: "checkmark")
-                                .foregroundColor(.cyan)
-                        }
-                    }
-                }
-                .listRowBackground(Color.white.opacity(0.08))
-
-                // Per-device audio selection
-                ForEach(sortedDevices, id: \.self) { device in
-                    Button {
-                        audioSource = device
-                        applyAudioSource()
-                        showAudioSourceSheet = false
-                    } label: {
-                        HStack {
-                            Image(systemName: "mic.fill")
-                                .foregroundColor(.white)
-                                .frame(width: 28)
-                            Text(device)
-                                .font(.system(size: 14, weight: .medium, design: .monospaced))
-                                .foregroundColor(.white)
-                            Spacer()
-                            if audioSource == device {
-                                Image(systemName: "checkmark")
-                                    .foregroundColor(.cyan)
+                    .listStyle(.insetGrouped)
+                    .scrollContentBackground(.hidden)
+                } else {
+                    // ── PITCH タブ ──
+                    List {
+                        ForEach(Self.pitchPresets, id: \.cents) { preset in
+                            Button {
+                                pitchShiftCents = preset.cents
+                                applyPitchShift()
+                                if preset.cents != 0 {
+                                    // シートを閉じてからオーバーレイを表示
+                                    showAudioSheet = false
+                                    for (device, url) in videos {
+                                        playback.extractAudioIfNeeded(device: device, videoURL: url) { _ in }
+                                    }
+                                }
+                            } label: {
+                                HStack {
+                                    Image(systemName: preset.cents > 0 ? "arrow.up" : preset.cents < 0 ? "arrow.down" : "equal")
+                                        .foregroundColor(.white)
+                                        .frame(width: 28)
+                                    Text(preset.label)
+                                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                        .foregroundColor(.white)
+                                    Spacer()
+                                    if pitchShiftCents == preset.cents {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.cyan)
+                                    }
+                                }
                             }
+                            .listRowBackground(Color.white.opacity(0.08))
                         }
                     }
-                    .listRowBackground(Color.white.opacity(0.08))
+                    .scrollContentBackground(.hidden)
                 }
             }
-            .listStyle(.insetGrouped)
-            .scrollContentBackground(.hidden)
             .background(Color.black.ignoresSafeArea())
-            .navigationTitle("AUDIO SOURCE")
+            .navigationTitle("AUDIO")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("DONE") { showAudioSourceSheet = false }
+                    Button("DONE") { showAudioSheet = false }
+                        .foregroundColor(.cyan)
                 }
             }
         }

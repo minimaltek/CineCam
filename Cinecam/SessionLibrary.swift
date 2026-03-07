@@ -34,6 +34,8 @@ struct SessionRecord: Identifiable, Codable, Equatable {
     var selectedAudioDevice: String?
     /// 選択中の映像フィルタ（CIFilter名、nil = なし）
     var selectedVideoFilter: String?
+    /// ピッチシフト値（セント単位: 0 = 無効）
+    var pitchShiftCents: Float?
 
     /// URL に復元した辞書
     /// パスはサンドボックス相対（ファイル名のみ）で保存し、
@@ -75,10 +77,11 @@ struct SessionRecord: Identifiable, Codable, Equatable {
         lockedDevices = try? c.decode([String].self, forKey: .lockedDevices)
         selectedAudioDevice = try? c.decode(String.self, forKey: .selectedAudioDevice)
         selectedVideoFilter = try? c.decode(String.self, forKey: .selectedVideoFilter)
+        pitchShiftCents = try? c.decode(Float.self, forKey: .pitchShiftCents)
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, createdAt, videoPaths, editState, desiredOrientation, lockedDevices, selectedAudioDevice, selectedVideoFilter
+        case id, title, createdAt, videoPaths, editState, desiredOrientation, lockedDevices, selectedAudioDevice, selectedVideoFilter, pitchShiftCents
     }
 }
 
