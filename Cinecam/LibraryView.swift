@@ -178,7 +178,7 @@ struct LibraryView: View {
                             let y = c.component(.year, from: record.createdAt)
                             let m = c.component(.month, from: record.createdAt)
                             let d = c.component(.day, from: record.createdAt)
-                            return "\(y)/\(m)/\(d)"
+                            return String(format: "%d.%02d.%02d", y, m, d)
                         }())
                             .font(.caption)
                             .foregroundColor(.white.opacity(0.4))

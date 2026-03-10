@@ -8,6 +8,90 @@ import AVKit
 import AVFoundation
 import AVFAudio
 import Combine
+// MARK: - FilterParamsHolder
+/// AVMutableVideoComposition プレビュー用のスレッドセーフなフィルタパラメータホルダー。
+/// composition の handler が毎フレーム snapshot() で読み取り、
+/// パラメータ変更は update() で即座に反映される（composition 再生成不要）。
+final class FilterParamsHolder: @unchecked Sendable {
+    private let lock = NSLock()
+
+    private var _videoFilter: String? = nil
+    private var _kaleidoscopeType: String? = nil
+    private var _kaleidoscopeSize: Float = 200
+    private var _centerX: Float = 0.5
+    private var _centerY: Float = 0.5
+    private var _tileHeight: Float = 200
+    private var _mirrorDirection: Int = 0
+    private var _rotationAngle: Float = 0
+    private var _generation: Int = 0
+
+    struct Snapshot {
+        let videoFilter: String?
+        let kaleidoscopeType: String?
+        let kaleidoscopeSize: Float
+        let centerX: Float
+        let centerY: Float
+        let tileHeight: Float
+        let mirrorDirection: Int
+        let rotationAngle: Float
+        let generation: Int
+        var hasEffect: Bool { videoFilter != nil || kaleidoscopeType != nil }
+    }
+
+    func update(
+        videoFilter: String?,
+        kaleidoscopeType: String?,
+        kaleidoscopeSize: Float,
+        centerX: Float,
+        centerY: Float,
+        tileHeight: Float,
+        mirrorDirection: Int,
+        rotationAngle: Float = 0
+    ) {
+        lock.lock()
+        _videoFilter = videoFilter
+        _kaleidoscopeType = kaleidoscopeType
+        _kaleidoscopeSize = kaleidoscopeSize
+        _centerX = centerX
+        _centerY = centerY
+        _tileHeight = tileHeight
+        _mirrorDirection = mirrorDirection
+        _rotationAngle = rotationAngle
+        _generation += 1
+        lock.unlock()
+    }
+
+    /// AUTO回転用: rotationAngle だけをアトミックに更新する（他パラメータはそのまま）
+    func updateRotationAngle(_ angle: Float) {
+        lock.lock()
+        _rotationAngle = angle
+        _generation += 1
+        lock.unlock()
+    }
+
+    /// 現在の rotationAngle を読み取る
+    func currentRotationAngle() -> Float {
+        lock.lock()
+        defer { lock.unlock() }
+        return _rotationAngle
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            videoFilter: _videoFilter,
+            kaleidoscopeType: _kaleidoscopeType,
+            kaleidoscopeSize: _kaleidoscopeSize,
+            centerX: _centerX,
+            centerY: _centerY,
+            tileHeight: _tileHeight,
+            mirrorDirection: _mirrorDirection,
+            rotationAngle: _rotationAngle,
+            generation: _generation
+        )
+    }
+}
 
 // MARK: - PlaybackController
 // Timer・AVPlayer の状態をクラスで管理することで、
@@ -54,6 +138,106 @@ final class PlaybackController: ObservableObject {
     private var lastAppliedFilterSegID: UUID? = nil
     /// フィルタ適用の世代番号（古い非同期Taskの結果を破棄するため）
     private var filterGeneration: Int = 0
+    /// フィルタパラメータホルダー（composition handler が毎フレーム snapshot() で読み取る）
+    let filterParamsHolder = FilterParamsHolder()
+
+    // MARK: - Composition Management
+
+    /// 各デバイスに設定済みの AVMutableVideoComposition
+    private(set) var activeCompositions: [String: AVMutableVideoComposition] = [:]
+    /// composition 構築中フラグ（二重構築防止）
+    private var buildingCompositionFor: Set<String> = []
+    /// item.status の KVO 監視（readyToPlay 後に composition を構築）
+    private var readyObservations: [String: NSKeyValueObservation] = [:]
+
+    /// 指定デバイスのプレイヤーに AVMutableVideoComposition を構築して設定する。
+    /// handler 内で filterParamsHolder.snapshot() を毎フレーム読み取るため、
+    /// パラメータ変更時に再構築不要（~33ms で次フレーム反映）。
+    func buildAndApplyComposition(for device: String) {
+        guard let player = players[device],
+              let item = player.currentItem,
+              !buildingCompositionFor.contains(device) else { return }
+
+        // readyToPlay でなければ KVO で待機して、ready になったら再度呼ぶ
+        if item.status != .readyToPlay {
+            guard readyObservations[device] == nil else { return } // 既に監視中
+            let observation = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
+                guard observedItem.status == .readyToPlay else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.readyObservations.removeValue(forKey: device)
+                    self.buildAndApplyComposition(for: device)
+                }
+            }
+            readyObservations[device] = observation
+            return
+        }
+
+        buildingCompositionFor.insert(device)
+        let holder = self.filterParamsHolder
+
+        Task { @MainActor in
+            defer { buildingCompositionFor.remove(device) }
+
+            guard let asset = player.currentItem?.asset else { return }
+
+            do {
+                let composition = try await AVMutableVideoComposition.videoComposition(
+                    with: asset,
+                    applyingCIFiltersWithHandler: { [weak holder] request in
+                        guard let holder = holder else {
+                            request.finish(with: request.sourceImage, context: nil)
+                            return
+                        }
+                        let params = holder.snapshot()
+
+                        // フィルタ効果がない場合はそのまま返す（最速パス）
+                        guard params.hasEffect else {
+                            request.finish(with: request.sourceImage, context: nil)
+                            return
+                        }
+
+                        let filtered = PlaybackController.applyFilters(
+                            to: request.sourceImage,
+                            videoFilter: params.videoFilter,
+                            kaleidoscopeType: params.kaleidoscopeType,
+                            kaleidoscopeSize: params.kaleidoscopeSize,
+                            centerX: params.centerX,
+                            centerY: params.centerY,
+                            tileHeight: params.tileHeight,
+                            mirrorDirection: params.mirrorDirection,
+                            rotationAngle: params.rotationAngle
+                        )
+                        request.finish(with: filtered, context: nil)
+                    }
+                )
+
+                self.activeCompositions[device] = composition
+                player.currentItem?.videoComposition = composition
+
+            } catch {
+                print("[Composition] Failed to build for \(device): \(error)")
+                player.currentItem?.videoComposition = nil
+            }
+        }
+    }
+
+    /// 指定デバイスの composition が必要なら構築する（遅延構築用）
+    func ensureComposition(for device: String) {
+        let params = filterParamsHolder.snapshot()
+        if params.hasEffect && activeCompositions[device] == nil {
+            buildAndApplyComposition(for: device)
+        }
+    }
+
+    /// 全プレイヤーの videoComposition を除去（フィルタなし状態に戻す）
+    func removeAllCompositions() {
+        for (device, player) in players {
+            player.currentItem?.videoComposition = nil
+            activeCompositions.removeValue(forKey: device)
+        }
+        readyObservations.removeAll()
+    }
 
     // MARK: - Pitch Shift (AVAudioEngine)
     private var audioEngine: AVAudioEngine?
@@ -71,8 +255,56 @@ final class PlaybackController: ObservableObject {
     /// エンジンが動作中か
     private var isPitchEngineRunning: Bool { audioEngine?.isRunning ?? false }
 
+    // MARK: - Auto Rotation
+    private var autoRotateTimer: Timer?
+    private var autoRotateLastTime: CFAbsoluteTime = 0
+    /// AUTO回転速度（rad/sec, 0 = OFF）
+    var autoRotateSpeed: Float = 0
+    /// AUTO回転中の現在角度（オーバーレイ同期用）
+    @Published var liveRotationAngle: Float = 0
+
+    /// AUTO回転を開始する
+    func startAutoRotation(speed: Float) {
+        autoRotateSpeed = speed
+        guard speed != 0 else {
+            stopAutoRotation()
+            return
+        }
+        autoRotateLastTime = CFAbsoluteTimeGetCurrent()
+        autoRotateTimer?.invalidate()
+        autoRotateTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.tickAutoRotation()
+            }
+        }
+    }
+
+    /// AUTO回転を停止する
+    func stopAutoRotation() {
+        autoRotateTimer?.invalidate()
+        autoRotateTimer = nil
+        autoRotateSpeed = 0
+    }
+
+    /// AUTO回転タイマーの毎フレーム処理
+    private func tickAutoRotation() {
+        let now = CFAbsoluteTimeGetCurrent()
+        let dt = Float(now - autoRotateLastTime)
+        autoRotateLastTime = now
+        guard autoRotateSpeed != 0, dt > 0, dt < 1.0 else { return }
+        let currentAngle = filterParamsHolder.currentRotationAngle()
+        let newAngle = currentAngle + autoRotateSpeed * dt
+        filterParamsHolder.updateRotationAngle(newAngle)
+        liveRotationAngle = newAngle
+        // 一時停止中はフレームを強制更新
+        if !isPlaying {
+            refreshCompositionForCurrentFrame()
+        }
+    }
+
     func setup(videos: [String: URL]) {
         players = videos.mapValues { AVPlayer(url: $0) }
+        // composition は applyVideoFilter() 呼び出し時にオンデマンドで構築する
     }
 
     /// AVPlayer を現在の playbackRate で再生する
@@ -85,7 +317,12 @@ final class PlaybackController: ObservableObject {
         preloadedNext = nil
         players.values.forEach { $0.pause() }
         stopPitchEngine()
+        stopAutoRotation()
         stopTimer()
+        // Composition のクリーンアップ
+        removeAllCompositions()
+        readyObservations.removeAll()
+        buildingCompositionFor.removeAll()
     }
 
     // MARK: - Pitch Engine Setup / Control
@@ -321,45 +558,95 @@ final class PlaybackController: ObservableObject {
         player.pause()
     }
 
-    // MARK: - Video Filter (CIFilter via AVVideoComposition)
+    // MARK: - Video Filter (AVMutableVideoComposition プレビュー)
 
-    /// CIFilter をプレイヤーの映像にリアルタイム適用する
-    func applyVideoFilter(filterName: String?, kaleidoscopeType: String?, kaleidoscopeSize: Float, centerX: Float = 0.5, centerY: Float = 0.5, tileHeight: Float = 200, mirrorDirection: Int = 0) {
-        let gen = filterGeneration
-        for (_, player) in players {
-            guard let item = player.currentItem else { continue }
-            // フィルタなしならクリア
-            guard filterName != nil || kaleidoscopeType != nil else {
-                item.videoComposition = nil
-                continue
+    /// フィルタパラメータを更新する（composition handler が次フレームで自動反映）
+    func applyVideoFilter(filterName: String?, kaleidoscopeType: String?, kaleidoscopeSize: Float, centerX: Float = 0.5, centerY: Float = 0.5, tileHeight: Float = 200, mirrorDirection: Int = 0, rotationAngle: Float = 0) {
+        filterParamsHolder.update(
+            videoFilter: filterName,
+            kaleidoscopeType: kaleidoscopeType,
+            kaleidoscopeSize: kaleidoscopeSize,
+            centerX: centerX,
+            centerY: centerY,
+            tileHeight: tileHeight,
+            mirrorDirection: mirrorDirection,
+            rotationAngle: rotationAngle
+        )
+        let hasEffect = filterName != nil || kaleidoscopeType != nil
+        if hasEffect {
+            // アクティブデバイスの composition を優先構築（他は切り替え時に遅延構築）
+            if !activePreviewDevice.isEmpty {
+                ensureComposition(for: activePreviewDevice)
             }
-            let asset = item.asset
-            Task {
-                do {
-                    let comp = try await AVMutableVideoComposition.videoComposition(
-                        with: asset,
-                        applyingCIFiltersWithHandler: { request in
-                            var image = request.sourceImage
-                            image = Self.applyFilters(
-                                to: image,
-                                videoFilter: filterName,
-                                kaleidoscopeType: kaleidoscopeType,
-                                kaleidoscopeSize: kaleidoscopeSize,
-                                centerX: centerX,
-                                centerY: centerY,
-                                tileHeight: tileHeight,
-                                mirrorDirection: mirrorDirection
-                            )
-                            request.finish(with: image, context: nil)
+            // 一時停止中でもフレームを再描画させるため seek で強制更新
+            refreshCompositionForCurrentFrame()
+        } else {
+            // フィルタなし → composition を除去して素の再生に戻す
+            removeAllCompositions()
+        }
+    }
+
+    /// フィルタパラメータ変更後にプレビューフレームを強制更新する（一時停止中のみ）。
+    /// 一時停止中は seek では composition handler が呼ばれないため、
+    /// 新しい composition オブジェクトを構築して item.videoComposition に設定する。
+    /// buildingCompositionFor ガードをバイパスし、常に最新パラメータで再構築する。
+    private var refreshGeneration: Int = 0
+    private func refreshCompositionForCurrentFrame() {
+        let device = activePreviewDevice
+        guard !device.isEmpty,
+              let player = players[device],
+              player.rate == 0,
+              let item = player.currentItem,
+              item.status == .readyToPlay else {
+            return
+        }
+
+        refreshGeneration += 1
+        let myGeneration = refreshGeneration
+        let holder = self.filterParamsHolder
+        guard let asset = item.asset as? AVAsset else { return }
+
+        Task { @MainActor in
+            // この世代より新しいリクエストが来ていたら、この構築結果は破棄
+            guard self.refreshGeneration == myGeneration else { return }
+
+            do {
+                let composition = try await AVMutableVideoComposition.videoComposition(
+                    with: asset,
+                    applyingCIFiltersWithHandler: { [weak holder] request in
+                        guard let holder = holder else {
+                            request.finish(with: request.sourceImage, context: nil)
+                            return
                         }
-                    )
-                    await MainActor.run {
-                        guard self.filterGeneration == gen else { return }
-                        item.videoComposition = comp
+                        let params = holder.snapshot()
+
+                        guard params.hasEffect else {
+                            request.finish(with: request.sourceImage, context: nil)
+                            return
+                        }
+
+                        let filtered = PlaybackController.applyFilters(
+                            to: request.sourceImage,
+                            videoFilter: params.videoFilter,
+                            kaleidoscopeType: params.kaleidoscopeType,
+                            kaleidoscopeSize: params.kaleidoscopeSize,
+                            centerX: params.centerX,
+                            centerY: params.centerY,
+                            tileHeight: params.tileHeight,
+                            mirrorDirection: params.mirrorDirection,
+                            rotationAngle: params.rotationAngle
+                        )
+                        request.finish(with: filtered, context: nil)
                     }
-                } catch {
-                    print("[FILTER] Failed to create videoComposition: \(error)")
-                }
+                )
+
+                // この世代より新しいリクエストが来ていたら破棄
+                guard self.refreshGeneration == myGeneration else { return }
+
+                self.activeCompositions[device] = composition
+                item.videoComposition = composition
+            } catch {
+                print("[Refresh] Failed to rebuild composition: \(error)")
             }
         }
     }
@@ -389,52 +676,21 @@ final class PlaybackController: ObservableObject {
             player.rate = playbackRate
         }
 
-        guard let player = players[device], let item = player.currentItem else { return }
-
-        // フィルタ/万華鏡がデフォルトなら videoComposition をクリア
-        let hasVisualEffect = settings.videoFilter != nil || settings.kaleidoscopeType != nil
-        guard hasVisualEffect else {
-            item.videoComposition = nil
-            return
-        }
-
-        let asset = item.asset
-        let filterName = settings.videoFilter
-        let kType = settings.kaleidoscopeType
-        let kSize = settings.kaleidoscopeSize
-        let cx = settings.kaleidoscopeCenterX
-        let cy = settings.kaleidoscopeCenterY
-        let th = settings.tileHeight
-        let md = settings.mirrorDirection
-        let gen = filterGeneration
-
-        Task {
-            do {
-                let comp = try await AVMutableVideoComposition.videoComposition(
-                    with: asset,
-                    applyingCIFiltersWithHandler: { request in
-                        var image = request.sourceImage
-                        image = Self.applyFilters(
-                            to: image,
-                            videoFilter: filterName,
-                            kaleidoscopeType: kType,
-                            kaleidoscopeSize: kSize,
-                            centerX: cx,
-                            centerY: cy,
-                            tileHeight: th,
-                            mirrorDirection: md
-                        )
-                        request.finish(with: image, context: nil)
-                    }
-                )
-                await MainActor.run {
-                    // 古い世代の結果は破棄
-                    guard self.filterGeneration == gen else { return }
-                    item.videoComposition = comp
-                }
-            } catch {
-                print("[FILTER] applyFilterForSegment failed: \(error)")
-            }
+        // filterParamsHolder を更新（composition handler が次フレームで自動読取）
+        filterParamsHolder.update(
+            videoFilter: settings.videoFilter,
+            kaleidoscopeType: settings.kaleidoscopeType,
+            kaleidoscopeSize: settings.kaleidoscopeSize,
+            centerX: settings.kaleidoscopeCenterX,
+            centerY: settings.kaleidoscopeCenterY,
+            tileHeight: settings.tileHeight,
+            mirrorDirection: settings.mirrorDirection,
+            rotationAngle: settings.rotationAngle
+        )
+        // フィルタ効果がある場合、composition 未構築なら構築する
+        let hasEffect = settings.videoFilter != nil || settings.kaleidoscopeType != nil
+        if hasEffect {
+            ensureComposition(for: device)
         }
     }
 
@@ -446,7 +702,7 @@ final class PlaybackController: ObservableObject {
 
     /// CIFilter 適用ヘルパー（プレビュー・エクスポート共通）
     /// centerX/centerY は 0.0〜1.0 の正規化値（0.5 = 映像中央）
-    nonisolated static func applyFilters(to image: CIImage, videoFilter: String?, kaleidoscopeType: String?, kaleidoscopeSize: Float, centerX: Float = 0.5, centerY: Float = 0.5, tileHeight: Float = 200, mirrorDirection: Int = 0) -> CIImage {
+    nonisolated static func applyFilters(to image: CIImage, videoFilter: String?, kaleidoscopeType: String?, kaleidoscopeSize: Float, centerX: Float = 0.5, centerY: Float = 0.5, tileHeight: Float = 200, mirrorDirection: Int = 0, rotationAngle: Float = 0) -> CIImage {
         var result = image
         let extent = image.extent
 
@@ -554,7 +810,7 @@ final class PlaybackController: ObservableObject {
                     kf.setValue(result, forKey: kCIInputImageKey)
                     kf.setValue(center, forKey: "inputPoint")
                     kf.setValue(kaleidoscopeSize, forKey: "inputSize")
-                    kf.setValue(0.0, forKey: "inputRotation")
+                    kf.setValue(rotationAngle, forKey: "inputRotation")
                     kf.setValue(1.4, forKey: "inputDecay")
                     if let out = kf.outputImage {
                         result = out.cropped(to: extent)
@@ -565,7 +821,7 @@ final class PlaybackController: ObservableObject {
                     kf.setValue(result, forKey: kCIInputImageKey)
                     kf.setValue(center, forKey: "inputCenter")
                     kf.setValue(6, forKey: "inputCount")
-                    kf.setValue(0.0, forKey: "inputAngle")
+                    kf.setValue(rotationAngle, forKey: "inputAngle")
                     if let out = kf.outputImage {
                         result = out.cropped(to: extent)
                     }
@@ -581,9 +837,10 @@ final class PlaybackController: ObservableObject {
                     width: CGFloat(kaleidoscopeSize), height: CGFloat(tileHeight)
                 )
                 let cropped = result.cropped(to: cropRect)
-                // CIAffineTile で元画像のクロップ領域をそのまま繰り返し
+                // 原点(0,0)に移動してからタイリング（原点ズレによるタイル不整合を防止）
+                let translated = cropped.transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
                 if let tileFilt = CIFilter(name: "CIAffineTile") {
-                    tileFilt.setValue(cropped, forKey: kCIInputImageKey)
+                    tileFilt.setValue(translated, forKey: kCIInputImageKey)
                     tileFilt.setValue(NSValue(cgAffineTransform: .identity), forKey: "inputTransform")
                     if let out = tileFilt.outputImage {
                         result = out.cropped(to: extent)
@@ -594,7 +851,7 @@ final class PlaybackController: ObservableObject {
                     kf.setValue(result, forKey: kCIInputImageKey)
                     kf.setValue(center, forKey: "inputCenter")
                     kf.setValue(kaleidoscopeSize, forKey: "inputWidth")
-                    kf.setValue(0.0, forKey: "inputAngle")
+                    kf.setValue(rotationAngle, forKey: "inputAngle")
                     if let out = kf.outputImage {
                         result = out.cropped(to: extent)
                     }
@@ -604,7 +861,7 @@ final class PlaybackController: ObservableObject {
                     kf.setValue(result, forKey: kCIInputImageKey)
                     kf.setValue(center, forKey: "inputCenter")
                     kf.setValue(kaleidoscopeSize, forKey: "inputWidth")
-                    kf.setValue(0.0, forKey: "inputAngle")
+                    kf.setValue(rotationAngle, forKey: "inputAngle")
                     if let out = kf.outputImage {
                         result = out.cropped(to: extent)
                     }
@@ -676,7 +933,7 @@ final class PlaybackController: ObservableObject {
                     kf.setValue(result, forKey: kCIInputImageKey)
                     kf.setValue(center, forKey: "inputCenter")
                     kf.setValue(8, forKey: "inputCount")
-                    kf.setValue(0.0, forKey: "inputAngle")
+                    kf.setValue(rotationAngle, forKey: "inputAngle")
                     if let out = kf.outputImage {
                         kaleidoResult = out.cropped(to: extent)
                     }
@@ -1251,6 +1508,12 @@ struct PreviewView: View {
     @State private var tileHeight: Float = 200
     /// MIRROR用の反転方向（0=左を反転, 1=右を反転）
     @State private var mirrorDirection: Int = 0
+    /// 回転角度（ラジアン）
+    @State private var rotationAngle: Float = 0
+    /// AUTO回転ON/OFF
+    @State private var isAutoRotating: Bool = false
+    /// AUTO回転速度（rad/sec）
+    @State private var autoRotateSpeed: Float = 1.0
     /// セグメント単位のフィルタ設定
     @State private var segmentFilterSettings: [UUID: SegmentFilterSettings] = [:]
     /// フィルタ編集対象セグメント（nil = グローバル/ALL）
@@ -1406,14 +1669,7 @@ struct PreviewView: View {
             if !isReady && !videos.isEmpty {
                 ZStack {
                     Color.black.opacity(0.6)
-                    VStack(spacing: 12) {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(1.2)
-                        Text("LOADING")
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.7))
-                    }
+                    DancingLoaderView(size: 80)
                 }
                 .ignoresSafeArea()
                 .allowsHitTesting(true) // 下のUIへのタッチをブロック
@@ -1426,9 +1682,7 @@ struct PreviewView: View {
                 Color.black.opacity(0.6)
                     .ignoresSafeArea()
                 VStack(spacing: 16) {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                        .scaleEffect(2.0)
+                    DancingLoaderView(size: 100)
                     Text("Preparing audio...")
                         .font(.system(size: 15, weight: .medium, design: .monospaced))
                         .foregroundColor(.white.opacity(0.9))
@@ -1481,6 +1735,10 @@ struct PreviewView: View {
         }
         // デバイス切替時にピッチエンジンを再起動（「編集に従う」モードのみ）
         .onChange(of: playback.activePreviewDevice) { device in
+            // デバイス切替時にフィルタ composition を遅延構築
+            if !device.isEmpty {
+                playback.ensureComposition(for: device)
+            }
             guard pitchShiftCents != 0, audioSource == nil, playback.isPlaying, !device.isEmpty else { return }
             startPitchEngineIfNeeded()
         }
@@ -1532,10 +1790,13 @@ struct PreviewView: View {
                 ZStack {
                     ForEach(sortedDevices, id: \.self) { device in
                         if let player = playback.players[device] {
-                            FillPlayerView(player: player)
-                                .frame(width: boxW, height: boxH)
-                                .clipped()
-                                .opacity(visibleDevice == device ? 1 : 0)
+                            FillPlayerView(
+                                player: player,
+                                isVisible: visibleDevice == device
+                            )
+                            .frame(width: boxW, height: boxH)
+                            .clipped()
+                            .opacity(visibleDevice == device ? 1 : 0)
                         }
                     }
 
@@ -1543,11 +1804,87 @@ struct PreviewView: View {
                     if showFilterSheet, effectiveKaleidoscope != nil {
                         kaleidoscopeOverlay(boxSize: CGSize(width: boxW, height: boxH))
                     }
+
+                    // リアルタイムフィルタステータス（右下）
+                    filterStatusOverlay
                 }
                 .frame(width: boxW, height: boxH)
                 .clipped()
                 .frame(width: geo.size.width, height: geo.size.height)
             }
+        }
+    }
+
+    // MARK: - Filter Status Overlay
+
+    /// ciName → 表示用ラベルのルックアップ
+    private func filterDisplayName(_ ciName: String?) -> String? {
+        guard let ciName else { return nil }
+        if let match = Self.videoFilters.first(where: { $0.ciName == ciName }) {
+            return match.label
+        }
+        return nil
+    }
+
+    private func mirrorDisplayName(_ ciName: String?) -> String? {
+        guard let ciName else { return nil }
+        if let match = Self.kaleidoscopeFilters.first(where: { $0.ciName == ciName }) {
+            return match.label
+        }
+        return nil
+    }
+
+    /// 再生ヘッド位置のセグメントに実際に適用されているフィルタ設定を返す
+    private var playheadFilterSettings: SegmentFilterSettings {
+        if let segID = currentPlayingSegmentID(),
+           let settings = segmentFilterSettings[segID] {
+            return settings
+        }
+        // セグメント固有設定がなければグローバル設定
+        return SegmentFilterSettings(
+            videoFilter: selectedFilter,
+            kaleidoscopeType: selectedKaleidoscope,
+            kaleidoscopeSize: kaleidoscopeSize,
+            kaleidoscopeCenterX: kaleidoscopeCenterX,
+            kaleidoscopeCenterY: kaleidoscopeCenterY,
+            tileHeight: tileHeight,
+            mirrorDirection: mirrorDirection,
+            rotationAngle: rotationAngle,
+            autoRotateSpeed: isAutoRotating ? autoRotateSpeed : 0,
+            speedRate: playbackSpeed
+        )
+    }
+
+    /// プレビュー右下のリアルタイムフィルタステータス表示
+    @ViewBuilder
+    private var filterStatusOverlay: some View {
+        let s = playheadFilterSettings
+        let hasFilter = s.videoFilter != nil
+        let hasMirror = s.kaleidoscopeType != nil
+        let hasSpeed = s.speedRate != 1.0
+        let hasAutoRotate = s.autoRotateSpeed != 0
+
+        if hasFilter || hasMirror || hasSpeed {
+            VStack(alignment: .trailing, spacing: 1) {
+                if let name = filterDisplayName(s.videoFilter) {
+                    Text("FILTER:\(name)")
+                }
+                if let name = mirrorDisplayName(s.kaleidoscopeType) {
+                    Text("MIRROR:\(name)")
+                }
+                if hasSpeed {
+                    Text("SPEED:\(String(format: "%.2f", s.speedRate))x")
+                }
+            }
+            .font(.system(size: 7, weight: .semibold, design: .monospaced))
+            .foregroundColor(.white.opacity(0.6))
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(Color.black.opacity(0.35))
+            .cornerRadius(3)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            .padding(6)
+            .allowsHitTesting(false)
         }
     }
 
@@ -1576,7 +1913,7 @@ struct PreviewView: View {
     }
 
     /// 映像ピクセル座標の kaleidoscopeSize をスクリーン座標に変換する係数を計算
-    /// FillPlayerView は resizeAspectFill で映像を表示するため、
+    /// FillPlayerView は aspect-fill で映像を表示するため、
     /// 映像の短辺がbox全体にフィットし、長辺ははみ出してクリップされる
     private func videoToScreenScale(boxSize: CGSize) -> CGFloat {
         // 映像解像度を推定（アスペクト比から逆算）
@@ -1651,6 +1988,7 @@ struct PreviewView: View {
                 Circle()
                     .stroke(Color.yellow, lineWidth: 2)
                     .frame(width: radius * 2, height: radius * 2)
+                    .rotationEffect(.radians(Double(-(isAutoRotating ? playback.liveRotationAngle : effectiveRotationAngle))))
                     .position(x: cx, y: cy)
                     .allowsHitTesting(false)
 
@@ -1658,6 +1996,7 @@ struct PreviewView: View {
                 TriangleShape()
                     .stroke(Color.yellow, lineWidth: 2)
                     .frame(width: radius * 2, height: radius * 2 * 0.87)
+                    .rotationEffect(.radians(Double(-(isAutoRotating ? playback.liveRotationAngle : effectiveRotationAngle))))
                     .position(x: cx, y: cy)
                     .allowsHitTesting(false)
 
@@ -1677,11 +2016,11 @@ struct PreviewView: View {
 
                 // ドラッグで境界線を左右に移動
                 Rectangle()
-                    .fill(Color.clear)
+                    .fill(Color.yellow.opacity(0.01)) // 完全透明だとヒットテスト失敗する場合があるため微小不透明度
                     .frame(width: 44, height: boxSize.height)
                     .contentShape(Rectangle())
                     .position(x: lineX, y: boxSize.height / 2)
-                    .gesture(
+                    .highPriorityGesture(
                         DragGesture(minimumDistance: 1)
                             .onChanged { value in
                                 let newX = Float(value.location.x / boxSize.width).clamped(to: 0.05...0.95)
@@ -1893,7 +2232,7 @@ struct PreviewView: View {
 
                 // 書き出しボタン
                 Button {
-                    Task { await exportEngine.export(timeline: timeline, videos: videos, orientation: desiredOrientation, audioSource: audioSource, videoFilter: selectedFilter, showWatermark: true, pitchCents: pitchShiftCents, kaleidoscopeType: selectedKaleidoscope, kaleidoscopeSize: kaleidoscopeSize, kaleidoscopeCenterX: kaleidoscopeCenterX, kaleidoscopeCenterY: kaleidoscopeCenterY, tileHeight: tileHeight, segmentFilterSettings: segmentFilterSettings, speedRate: playbackSpeed) }  // TestFlight: 常に透かし表示（課金実装時に !purchaseManager.isPremium に戻す）
+                    Task { await exportEngine.export(timeline: timeline, videos: videos, orientation: desiredOrientation, audioSource: audioSource, videoFilter: selectedFilter, showWatermark: true, pitchCents: pitchShiftCents, kaleidoscopeType: selectedKaleidoscope, kaleidoscopeSize: kaleidoscopeSize, kaleidoscopeCenterX: kaleidoscopeCenterX, kaleidoscopeCenterY: kaleidoscopeCenterY, tileHeight: tileHeight, rotationAngle: rotationAngle, segmentFilterSettings: segmentFilterSettings, speedRate: playbackSpeed) }  // TestFlight: 常に透かし表示（課金実装時に !purchaseManager.isPremium に戻す）
                 } label: {
                     Image(systemName: "square.and.arrow.up")
                         .font(.system(size: 18, weight: .semibold))
@@ -2762,6 +3101,22 @@ struct PreviewView: View {
         return mirrorDirection
     }
 
+    /// 現在の編集スコープに応じた有効回転角度
+    private var effectiveRotationAngle: Float {
+        if let segID = filterEditingSegmentID {
+            return segmentFilterSettings[segID]?.rotationAngle ?? rotationAngle
+        }
+        return rotationAngle
+    }
+
+    /// 現在の編集スコープに応じた有効AUTO回転速度
+    private var effectiveAutoRotateSpeed: Float {
+        if let segID = filterEditingSegmentID {
+            return segmentFilterSettings[segID]?.autoRotateSpeed ?? autoRotateSpeed
+        }
+        return autoRotateSpeed
+    }
+
     /// 現在の編集スコープに応じた有効万華鏡中心X
     private var effectiveCenterX: Float {
         if let segID = filterEditingSegmentID {
@@ -2809,7 +3164,7 @@ struct PreviewView: View {
     }
 
     /// フィルタ変更をスコープに応じて適用する
-    private func applyFilterChange(videoFilter: String?? = nil, kaleidoscopeType: String?? = nil, kaleidoscopeSize: Float? = nil, centerX: Float? = nil, centerY: Float? = nil, tileHeight: Float? = nil, mirrorDirection: Int? = nil) {
+    private func applyFilterChange(videoFilter: String?? = nil, kaleidoscopeType: String?? = nil, kaleidoscopeSize: Float? = nil, centerX: Float? = nil, centerY: Float? = nil, tileHeight: Float? = nil, mirrorDirection: Int? = nil, rotationAngle: Float? = nil, autoRotateSpeed: Float? = nil) {
         if let segID = filterEditingSegmentID {
             // セグメント単位: 辞書を更新
             var settings = segmentFilterSettings[segID] ?? SegmentFilterSettings(
@@ -2819,7 +3174,9 @@ struct PreviewView: View {
                 kaleidoscopeCenterX: self.kaleidoscopeCenterX,
                 kaleidoscopeCenterY: self.kaleidoscopeCenterY,
                 tileHeight: self.tileHeight,
-                mirrorDirection: self.mirrorDirection
+                mirrorDirection: self.mirrorDirection,
+                rotationAngle: self.rotationAngle,
+                autoRotateSpeed: isAutoRotating ? self.autoRotateSpeed : 0
             )
             if let vf = videoFilter { settings.videoFilter = vf }
             if let kt = kaleidoscopeType { settings.kaleidoscopeType = kt }
@@ -2828,6 +3185,8 @@ struct PreviewView: View {
             if let cy = centerY { settings.kaleidoscopeCenterY = cy }
             if let th = tileHeight { settings.tileHeight = th }
             if let md = mirrorDirection { settings.mirrorDirection = md }
+            if let ra = rotationAngle { settings.rotationAngle = ra }
+            if let ars = autoRotateSpeed { settings.autoRotateSpeed = ars }
             segmentFilterSettings[segID] = settings
             // PlaybackController に同期
             playback.segmentFilterSettings = segmentFilterSettings
@@ -2840,7 +3199,8 @@ struct PreviewView: View {
                 centerX: settings.kaleidoscopeCenterX,
                 centerY: settings.kaleidoscopeCenterY,
                 tileHeight: settings.tileHeight,
-                mirrorDirection: settings.mirrorDirection
+                mirrorDirection: settings.mirrorDirection,
+                rotationAngle: settings.rotationAngle
             )
         } else {
             // グローバル: 既存の State 変数を更新
@@ -2851,6 +3211,8 @@ struct PreviewView: View {
             if let cy = centerY { self.kaleidoscopeCenterY = cy }
             if let th = tileHeight { self.tileHeight = th }
             if let md = mirrorDirection { self.mirrorDirection = md }
+            if let ra = rotationAngle { self.rotationAngle = ra }
+            if let ars = autoRotateSpeed { self.autoRotateSpeed = ars }
             // グローバル設定を PlaybackController に同期
             playback.globalFilterSettings = SegmentFilterSettings(
                 videoFilter: selectedFilter,
@@ -2859,10 +3221,12 @@ struct PreviewView: View {
                 kaleidoscopeCenterX: self.kaleidoscopeCenterX,
                 kaleidoscopeCenterY: self.kaleidoscopeCenterY,
                 tileHeight: self.tileHeight,
-                mirrorDirection: self.mirrorDirection
+                mirrorDirection: self.mirrorDirection,
+                rotationAngle: self.rotationAngle,
+                autoRotateSpeed: isAutoRotating ? self.autoRotateSpeed : 0
             )
             playback.invalidateFilterCache()
-            playback.applyVideoFilter(filterName: selectedFilter, kaleidoscopeType: selectedKaleidoscope, kaleidoscopeSize: self.kaleidoscopeSize, centerX: self.kaleidoscopeCenterX, centerY: self.kaleidoscopeCenterY, tileHeight: self.tileHeight, mirrorDirection: self.mirrorDirection)
+            playback.applyVideoFilter(filterName: selectedFilter, kaleidoscopeType: selectedKaleidoscope, kaleidoscopeSize: self.kaleidoscopeSize, centerX: self.kaleidoscopeCenterX, centerY: self.kaleidoscopeCenterY, tileHeight: self.tileHeight, mirrorDirection: self.mirrorDirection, rotationAngle: self.rotationAngle)
         }
     }
 
@@ -2970,49 +3334,82 @@ struct PreviewView: View {
                                 }
                             }
                             .listRowBackground(Color.white.opacity(0.08))
-                        }
 
-                        // コントロール（選択時のみ）
-                        if effectiveKaleidoscope != nil {
-                            if currentOverlayShape == .mirror {
-                                // MIRROR: L/R 切り替えボタン
-                                HStack(spacing: 12) {
-                                    Text("FLIP")
-                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.yellow)
-                                    Spacer()
-                                    Button {
-                                        mirrorDirection = 0
-                                        applyFilterChange(mirrorDirection: 0)
-                                    } label: {
-                                        Text("L")
-                                            .font(.system(size: 14, weight: .bold, design: .monospaced))
-                                            .frame(width: 40, height: 32)
-                                            .background(effectiveMirrorDirection == 0 ? Color.yellow : Color.white.opacity(0.15))
-                                            .foregroundColor(effectiveMirrorDirection == 0 ? .black : .white.opacity(0.7))
-                                            .clipShape(Capsule())
-                                    }
-                                    Button {
-                                        mirrorDirection = 1
-                                        applyFilterChange(mirrorDirection: 1)
-                                    } label: {
-                                        Text("R")
-                                            .font(.system(size: 14, weight: .bold, design: .monospaced))
-                                            .frame(width: 40, height: 32)
-                                            .background(effectiveMirrorDirection == 1 ? Color.yellow : Color.white.opacity(0.15))
-                                            .foregroundColor(effectiveMirrorDirection == 1 ? .black : .white.opacity(0.7))
-                                            .clipShape(Capsule())
-                                    }
-                                }
-                                .listRowBackground(Color.white.opacity(0.08))
-                            } else if currentOverlayShape == .tile {
-                                // TILE: 横幅・縦幅の独立スライダー
-                                VStack(spacing: 8) {
-                                    HStack(spacing: 8) {
-                                        Text("W")
+                            // 選択中のフィルタの直後にコントロールを表示（NONE時は非表示）
+                            if effectiveKaleidoscope == kfilter.ciName, kfilter.ciName != nil {
+                                if currentOverlayShape == .mirror {
+                                    // MIRROR: L/R 切り替えボタン
+                                    HStack(spacing: 12) {
+                                        Text("FLIP")
                                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                                             .foregroundColor(.yellow)
-                                            .frame(width: 16)
+                                        Spacer()
+                                        Button {
+                                            applyFilterChange(mirrorDirection: 0)
+                                        } label: {
+                                            Text("L")
+                                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                                .frame(width: 40, height: 32)
+                                                .background(effectiveMirrorDirection == 0 ? Color.yellow : Color.white.opacity(0.15))
+                                                .foregroundColor(effectiveMirrorDirection == 0 ? .black : .white.opacity(0.7))
+                                                .clipShape(Capsule())
+                                        }
+                                        .buttonStyle(.borderless)
+                                        Button {
+                                            applyFilterChange(mirrorDirection: 1)
+                                        } label: {
+                                            Text("R")
+                                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                                .frame(width: 40, height: 32)
+                                                .background(effectiveMirrorDirection == 1 ? Color.yellow : Color.white.opacity(0.15))
+                                                .foregroundColor(effectiveMirrorDirection == 1 ? .black : .white.opacity(0.7))
+                                                .clipShape(Capsule())
+                                        }
+                                        .buttonStyle(.borderless)
+                                    }
+                                    .listRowBackground(Color.white.opacity(0.08))
+                                } else if currentOverlayShape == .tile {
+                                    // TILE: 横幅・縦幅の独立スライダー
+                                    VStack(spacing: 8) {
+                                        HStack(spacing: 8) {
+                                            Text("W")
+                                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                                .foregroundColor(.yellow)
+                                                .frame(width: 16)
+                                            Slider(value: Binding(
+                                                get: { effectiveKaleidoscopeSize },
+                                                set: { applyFilterChange(kaleidoscopeSize: $0) }
+                                            ), in: 30...1000)
+                                            .tint(.yellow)
+                                            Text("\(Int(effectiveKaleidoscopeSize))")
+                                                .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                                .foregroundColor(.white.opacity(0.5))
+                                                .frame(width: 36, alignment: .trailing)
+                                        }
+                                        HStack(spacing: 8) {
+                                            Text("H")
+                                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                                .foregroundColor(.yellow)
+                                                .frame(width: 16)
+                                            Slider(value: Binding(
+                                                get: { effectiveTileHeight },
+                                                set: { applyFilterChange(tileHeight: $0) }
+                                            ), in: 30...1000)
+                                            .tint(.yellow)
+                                            Text("\(Int(effectiveTileHeight))")
+                                                .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                                .foregroundColor(.white.opacity(0.5))
+                                                .frame(width: 36, alignment: .trailing)
+                                        }
+                                    }
+                                    .listRowBackground(Color.white.opacity(0.08))
+                                } else {
+                                    // CIRCLE / TRIANGLE 等: 単一のSIZEスライダー
+                                    HStack(spacing: 8) {
+                                        Text("SIZE")
+                                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                            .foregroundColor(.yellow)
+                                            .frame(width: 36)
                                         Slider(value: Binding(
                                             get: { effectiveKaleidoscopeSize },
                                             set: { applyFilterChange(kaleidoscopeSize: $0) }
@@ -3023,41 +3420,81 @@ struct PreviewView: View {
                                             .foregroundColor(.white.opacity(0.5))
                                             .frame(width: 36, alignment: .trailing)
                                     }
+                                    .listRowBackground(Color.white.opacity(0.08))
+                                    // ROTATE スライダー（AUTO OFF時のみ手動操作）
                                     HStack(spacing: 8) {
-                                        Text("H")
+                                        Text("ROT")
                                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                                             .foregroundColor(.yellow)
-                                            .frame(width: 16)
+                                            .frame(width: 36)
                                         Slider(value: Binding(
-                                            get: { effectiveTileHeight },
-                                            set: { applyFilterChange(tileHeight: $0) }
-                                        ), in: 30...1000)
+                                            get: { effectiveRotationAngle },
+                                            set: { applyFilterChange(rotationAngle: $0) }
+                                        ), in: 0...Float.pi * 2)
                                         .tint(.yellow)
-                                        Text("\(Int(effectiveTileHeight))")
+                                        .disabled(isAutoRotating)
+                                        .opacity(isAutoRotating ? 0.4 : 1.0)
+                                        Text(String(format: "%.1f°", effectiveRotationAngle * 180 / .pi))
                                             .font(.system(size: 11, weight: .regular, design: .monospaced))
                                             .foregroundColor(.white.opacity(0.5))
-                                            .frame(width: 36, alignment: .trailing)
+                                            .frame(width: 42, alignment: .trailing)
                                     }
+                                    .listRowBackground(Color.white.opacity(0.08))
+                                    // AUTO回転トグル + SPEED スライダー
+                                    VStack(spacing: 8) {
+                                        HStack(spacing: 12) {
+                                            Text("AUTO")
+                                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                                .foregroundColor(.yellow)
+                                            Spacer()
+                                            Button {
+                                                isAutoRotating.toggle()
+                                                if isAutoRotating {
+                                                    playback.startAutoRotation(speed: autoRotateSpeed)
+                                                    // エクスポート用に autoRotateSpeed を設定に保存
+                                                    applyFilterChange(autoRotateSpeed: autoRotateSpeed)
+                                                } else {
+                                                    playback.stopAutoRotation()
+                                                    // 停止時の現在角度を State に同期
+                                                    let currentAngle = playback.filterParamsHolder.currentRotationAngle()
+                                                    rotationAngle = currentAngle
+                                                    // エクスポート用に autoRotateSpeed を 0 に
+                                                    applyFilterChange(rotationAngle: currentAngle, autoRotateSpeed: 0)
+                                                }
+                                            } label: {
+                                                Text(isAutoRotating ? "ON" : "OFF")
+                                                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                                    .frame(width: 50, height: 32)
+                                                    .background(isAutoRotating ? Color.yellow : Color.white.opacity(0.15))
+                                                    .foregroundColor(isAutoRotating ? .black : .white.opacity(0.7))
+                                                    .clipShape(Capsule())
+                                            }
+                                            .buttonStyle(.borderless)
+                                        }
+                                        if isAutoRotating {
+                                            HStack(spacing: 8) {
+                                                Text("SPD")
+                                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                                    .foregroundColor(.yellow)
+                                                    .frame(width: 36)
+                                                Slider(value: Binding(
+                                                    get: { autoRotateSpeed },
+                                                    set: { newSpeed in
+                                                        autoRotateSpeed = newSpeed
+                                                        playback.startAutoRotation(speed: newSpeed)
+                                                        applyFilterChange(autoRotateSpeed: newSpeed)
+                                                    }
+                                                ), in: 0.1...2.0)
+                                                .tint(.yellow)
+                                                Text(String(format: "%.1f", autoRotateSpeed))
+                                                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                                    .foregroundColor(.white.opacity(0.5))
+                                                    .frame(width: 30, alignment: .trailing)
+                                            }
+                                        }
+                                    }
+                                    .listRowBackground(Color.white.opacity(0.08))
                                 }
-                                .listRowBackground(Color.white.opacity(0.08))
-                            } else {
-                                // CIRCLE / TRIANGLE 等: 単一のSIZEスライダー
-                                HStack(spacing: 8) {
-                                    Text("SIZE")
-                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.yellow)
-                                        .frame(width: 36)
-                                    Slider(value: Binding(
-                                        get: { effectiveKaleidoscopeSize },
-                                        set: { applyFilterChange(kaleidoscopeSize: $0) }
-                                    ), in: 30...1000)
-                                    .tint(.yellow)
-                                    Text("\(Int(effectiveKaleidoscopeSize))")
-                                        .font(.system(size: 11, weight: .regular, design: .monospaced))
-                                        .foregroundColor(.white.opacity(0.5))
-                                        .frame(width: 36, alignment: .trailing)
-                                }
-                                .listRowBackground(Color.white.opacity(0.08))
                             }
                         }
                     }
@@ -3580,11 +4017,13 @@ struct PreviewView: View {
                 kaleidoscopeSize: kaleidoscopeSize,
                 kaleidoscopeCenterX: kaleidoscopeCenterX,
                 kaleidoscopeCenterY: kaleidoscopeCenterY,
+                rotationAngle: rotationAngle,
+                autoRotateSpeed: isAutoRotating ? autoRotateSpeed : 0,
                 speedRate: playbackSpeed
             )
             // 保存済みフィルタがあればプレビューに適用
             if selectedFilter != nil || selectedKaleidoscope != nil {
-                playback.applyVideoFilter(filterName: selectedFilter, kaleidoscopeType: selectedKaleidoscope, kaleidoscopeSize: kaleidoscopeSize, centerX: kaleidoscopeCenterX, centerY: kaleidoscopeCenterY, tileHeight: tileHeight)
+                playback.applyVideoFilter(filterName: selectedFilter, kaleidoscopeType: selectedKaleidoscope, kaleidoscopeSize: kaleidoscopeSize, centerX: kaleidoscopeCenterX, centerY: kaleidoscopeCenterY, tileHeight: tileHeight, mirrorDirection: mirrorDirection, rotationAngle: rotationAngle)
             }
             playback.totalDuration = timeline.totalDuration
             // 音声同期用に各デバイスの映像開始時刻を渡す
@@ -3607,11 +4046,11 @@ struct PreviewView: View {
         // アスペクト比はすぐ設定（サムネイルより先にレイアウトを確定）
         await MainActor.run { previewAspectRatio = desiredOrientation.aspectRatio }
 
-        // 準備完了（サムネイルは後からバックグラウンドで取得）
-        await MainActor.run { isReady = true }
-
-        // サムネイル取得（UIブロックしない）
+        // サムネイル取得（完了まで Loading 表示を維持）
         await generateAllThumbnails()
+
+        // サムネイル完了 → Loading 解除
+        await MainActor.run { isReady = true }
     }
 
     // MARK: - Playback Logic（seekPreview / toggle / seekToSegment は PlaybackController へ移譲済み）
@@ -4025,13 +4464,14 @@ private struct TimelineRow: View {
 
 }
 
-// MARK: - FillPlayerView (AVPlayerLayer with resizeAspectFill)
-
-/// UIViewRepresentable that uses AVPlayerLayer with videoGravity = .resizeAspectFill.
-/// This ensures all videos—regardless of their native orientation—fill the target box
-/// and get center-cropped identically.
+// MARK: - FillPlayerView (AVPlayerLayer-based video preview)
+private class PlayerFillUIView: UIView {
+    override class var layerClass: AnyClass { AVPlayerLayer.self }
+    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+}
 private struct FillPlayerView: UIViewRepresentable {
     let player: AVPlayer
+    let isVisible: Bool
 
     func makeUIView(context: Context) -> PlayerFillUIView {
         let view = PlayerFillUIView()
@@ -4045,12 +4485,12 @@ private struct FillPlayerView: UIViewRepresentable {
         if uiView.playerLayer.player !== player {
             uiView.playerLayer.player = player
         }
+        uiView.isHidden = !isVisible
     }
-}
 
-private class PlayerFillUIView: UIView {
-    override class var layerClass: AnyClass { AVPlayerLayer.self }
-    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    static func dismantleUIView(_ uiView: PlayerFillUIView, coordinator: ()) {
+        uiView.playerLayer.player = nil
+    }
 }
 
 // MARK: - ScrollOffsetKey

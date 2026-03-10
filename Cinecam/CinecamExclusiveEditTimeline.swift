@@ -10,6 +10,8 @@ struct SegmentFilterSettings: Equatable {
     var kaleidoscopeCenterY: Float = 0.5
     var tileHeight: Float = 200       // TILE用の縦幅（kaleidoscopeSize が横幅）
     var mirrorDirection: Int = 0      // MIRROR用: 0=左を反転, 1=右を反転
+    var rotationAngle: Float = 0     // 回転角度（ラジアン）
+    var autoRotateSpeed: Float = 0   // AUTO回転速度（rad/sec, 0 = OFF）
     var speedRate: Float = 1.0
     var isDefault: Bool { videoFilter == nil && kaleidoscopeType == nil && speedRate == 1.0 }
 }

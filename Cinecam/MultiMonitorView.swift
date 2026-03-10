@@ -69,8 +69,7 @@ struct MultiMonitorView: View {
                 if sortedDevices.isEmpty {
                     Spacer()
                     VStack(spacing: 12) {
-                        ProgressView()
-                            .tint(.white)
+                        DancingLoaderView(size: 60)
                         Text("Waiting for snapshot...")
                             .font(.system(size: 14))
                             .foregroundColor(.gray)
@@ -105,8 +104,7 @@ struct MultiMonitorView: View {
                     .fill(Color.gray.opacity(0.3))
                     .aspectRatio(16/9, contentMode: .fit)
                     .overlay(
-                        ProgressView()
-                            .tint(.white)
+                        DancingLoaderView(size: 40)
                     )
             }
             

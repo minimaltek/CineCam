@@ -28,6 +28,8 @@ struct SavedSegmentFilterSettings: Codable, Equatable {
     var kaleidoscopeCenterY: Float?
     var tileHeight: Float?
     var mirrorDirection: Int?
+    var rotationAngle: Float?
+    var autoRotateSpeed: Float?
     var speedRate: Float?
 
     init(from settings: SegmentFilterSettings) {
@@ -38,6 +40,8 @@ struct SavedSegmentFilterSettings: Codable, Equatable {
         self.kaleidoscopeCenterY = settings.kaleidoscopeCenterY
         self.tileHeight = settings.tileHeight
         self.mirrorDirection = settings.mirrorDirection
+        self.rotationAngle = settings.rotationAngle
+        self.autoRotateSpeed = settings.autoRotateSpeed
         self.speedRate = settings.speedRate
     }
 
@@ -50,6 +54,8 @@ struct SavedSegmentFilterSettings: Codable, Equatable {
             kaleidoscopeCenterY: kaleidoscopeCenterY ?? 0.5,
             tileHeight: tileHeight ?? 200,
             mirrorDirection: mirrorDirection ?? 0,
+            rotationAngle: rotationAngle ?? 0,
+            autoRotateSpeed: autoRotateSpeed ?? 0,
             speedRate: speedRate ?? 1.0
         )
     }

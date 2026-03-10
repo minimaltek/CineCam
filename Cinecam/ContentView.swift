@@ -12,9 +12,11 @@ import MultipeerConnectivity
 struct ContentView: View {
     @StateObject private var sessionManager = CameraSessionManager()
     @StateObject private var cameraManager = CameraManager()
+    @StateObject private var multiCamManager = MultiCamManager()
     @StateObject private var library = SessionLibrary.shared
     @State private var showSettings = false
     @State private var showLibrary = false
+    @State private var isSingleMode = false
     
     // 役割選択状態（nilなら未選択）
     @State private var selectedRole: DeviceRole? = nil
@@ -32,7 +34,10 @@ struct ContentView: View {
     
     var body: some View {
         Group {
-            if selectedRole == nil {
+            if isSingleMode {
+                // シングルモード（前面+背面同時録画）
+                singleModeScreen
+            } else if selectedRole == nil {
                 // 役割選択画面
                 roleSelectionScreen
             } else {
@@ -99,6 +104,16 @@ struct ContentView: View {
                 .onAppear { sessionManager.pauseDiscovery() }
         }
         .fullScreenCover(isPresented: $sessionManager.showPreview, onDismiss: {
+            // Single Mode からの復帰
+            if isSingleMode {
+                multiCamManager.stopSession()
+                OrientationLock.isCameraActive = false
+                sessionManager.resumeDiscovery()
+                withAnimation {
+                    isSingleMode = false
+                }
+                return
+            }
             let wasMaster = sessionManager.cleanupSessionAfterPreview()
             if sessionManager.persistentRole {
                 // ★ 永続モード: マスターもスレーブも現在の役割画面にとどまる
@@ -169,6 +184,18 @@ struct ContentView: View {
             }
         } message: {
             if let error = cameraManager.error {
+                Text(error)
+            }
+        }
+        .alert("Error", isPresented: .constant(multiCamManager.error != nil)) {
+            Button("OK") {
+                multiCamManager.error = nil
+                if isSingleMode {
+                    exitSingleMode()
+                }
+            }
+        } message: {
+            if let error = multiCamManager.error {
                 Text(error)
             }
         }
@@ -431,8 +458,31 @@ struct ContentView: View {
             
             Spacer()
             
-            // ── REBUILD SESSION（接続がない時に表示、アプリ再起動と同等の再構築） ──
+            // ── SINGLE MODE + REBUILD SESSION（接続がない時に表示） ──
             if sessionManager.connectedPeers.isEmpty {
+                // SINGLE MODE
+                Button(action: {
+                    enterSingleMode()
+                }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "camera.on.rectangle.fill")
+                            .font(.system(size: 14, weight: .semibold))
+                        Text("SINGLE MODE")
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                            .tracking(2)
+                    }
+                    .foregroundColor(.orange.opacity(0.7))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.orange.opacity(0.2), lineWidth: 1)
+                    )
+                }
+                .padding(.horizontal, 40)
+                .padding(.bottom, 12)
+                
+                // REBUILD SESSION
                 Button(action: {
                     sessionManager.rebuildSession()
                 }) {
@@ -517,6 +567,138 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+    
+    // MARK: - Single Mode
+    
+    private var singleModeScreen: some View {
+        ZStack {
+            if let backPreview = multiCamManager.backPreviewLayer,
+               let frontPreview = multiCamManager.frontPreviewLayer {
+                MultiCamPreviewView(
+                    backPreviewLayer: backPreview,
+                    frontPreviewLayer: frontPreview,
+                    activePosition: multiCamManager.activePosition,
+                    multiCamManager: multiCamManager
+                )
+                .ignoresSafeArea()
+                
+                // クロップガイド（メイン：撮影範囲外をグレーアウト）
+                CropGuideOverlay(desiredOrientation: multiCamManager.desiredOrientation)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                
+                // クロップガイド（PiP小窓）
+                VStack {
+                    HStack {
+                        Spacer()
+                        CropGuideOverlay(desiredOrientation: multiCamManager.desiredOrientation)
+                            .frame(width: 120, height: 160)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .padding(.top, 60)
+                            .padding(.trailing, 16)
+                    }
+                    Spacer()
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+                
+                // オーバーレイコントロール（既存UIと同等）
+                SingleModeOverlayControls(
+                    multiCamManager: multiCamManager,
+                    onExit: exitSingleMode
+                )
+            } else {
+                // カメラ初期化中
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .tint(.white)
+                    Text("INITIALIZING CAMERAS...")
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .tracking(2)
+                        .foregroundColor(.white.opacity(0.5))
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black.ignoresSafeArea())
+            }
+        }
+    }
+    
+    private func enterSingleMode() {
+        // 非対応端末チェック
+        guard MultiCamManager.isMultiCamSupported else {
+            cameraManager.error = "This device does not support dual-camera recording"
+            return
+        }
+        
+        sessionManager.pauseDiscovery()
+        
+        // CameraManagerから設定を引き継ぎ
+        multiCamManager.desiredOrientation = cameraManager.desiredOrientation
+        multiCamManager.videoCodec = cameraManager.videoCodec
+        
+        // 録画完了コールバック
+        multiCamManager.onRecordingCompleted = { [self] backURL, frontURL, sessionID in
+            handleSingleModeRecordingCompleted(backURL: backURL, frontURL: frontURL, sessionID: sessionID)
+        }
+        
+        // 先に画面遷移（ローディング画面を見せる）
+        OrientationLock.isCameraActive = true
+        withAnimation {
+            isSingleMode = true
+        }
+        
+        // マルチカムセッション起動（非同期で完了 → プレビューレイヤーが公開される）
+        multiCamManager.setupAndStart()
+    }
+    
+    private func exitSingleMode() {
+        multiCamManager.stopSession()
+        OrientationLock.isCameraActive = false
+        sessionManager.resumeDiscovery()
+        
+        withAnimation {
+            isSingleMode = false
+        }
+    }
+    
+    private func handleSingleModeRecordingCompleted(backURL: URL, frontURL: URL, sessionID: String) {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        
+        let backDest = docs.appendingPathComponent("\(sessionID)_BACK.mov")
+        let frontDest = docs.appendingPathComponent("\(sessionID)_FRONT.mov")
+        
+        do {
+            if FileManager.default.fileExists(atPath: backDest.path) {
+                try FileManager.default.removeItem(at: backDest)
+            }
+            try FileManager.default.copyItem(at: backURL, to: backDest)
+            
+            if FileManager.default.fileExists(atPath: frontDest.path) {
+                try FileManager.default.removeItem(at: frontDest)
+            }
+            try FileManager.default.copyItem(at: frontURL, to: frontDest)
+        } catch {
+            #if DEBUG
+            print("❌ [SingleMode] File copy error: \(error)")
+            #endif
+            return
+        }
+        
+        let videos: [String: URL] = [
+            "BACK": backDest,
+            "FRONT": frontDest
+        ]
+        
+        // 既存のプレビューパイプラインに接続
+        sessionManager.previewSessionID = sessionID
+        sessionManager.previewVideos = videos
+        
+        // ライブラリに追加
+        library.add(sessionID: sessionID, videos: videos, orientation: cameraManager.desiredOrientation)
+        
+        // プレビュー表示
+        sessionManager.showPreview = true
     }
     
     // MARK: - Main Screen
@@ -694,9 +876,7 @@ struct ContentView: View {
                 .ignoresSafeArea()
             
             VStack(spacing: 20) {
-                ProgressView()
-                    .scaleEffect(1.5)
-                    .tint(.orange)
+                DancingLoaderView(size: 80)
                 
                 Text("TRANSFERRING")
                     .font(.system(size: 14, weight: .bold, design: .monospaced))
@@ -802,10 +982,7 @@ struct ContentView: View {
                 if isWaiting {
                     // WAITING状態（グレー、ボタンではなく表示のみ）
                     VStack(spacing: 10) {
-                        ProgressView()
-                            .tint(.gray)
-                            .scaleEffect(1.2)
-                            .frame(height: 30)
+                        DancingLoaderView(size: 60)
                         
                         Text("WAITING")
                             .font(.system(size: 14, weight: .bold, design: .monospaced))
@@ -829,10 +1006,7 @@ struct ContentView: View {
                 } else if !hasPeers && sessionManager.isRetrying {
                     // RECONNECTING状態（リトライ中でピアなし）
                     VStack(spacing: 10) {
-                        ProgressView()
-                            .tint(.orange)
-                            .scaleEffect(1.2)
-                            .frame(height: 30)
+                        DancingLoaderView(size: 60)
                         
                         Text("RECONNECTING")
                             .font(.system(size: 14, weight: .bold, design: .monospaced))

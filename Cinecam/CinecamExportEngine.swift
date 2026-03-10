@@ -30,11 +30,11 @@ final class ExportEngine: ObservableObject {
     /// 書き出し実行 → カメラロールに保存
     /// - audioSource: nil = 編集に従う（カット毎の音声）、デバイス名 = そのデバイスの音声を全編に使用
     /// - pitchCents: ピッチシフト量（セント単位: 0 = 無効）
-    func export(timeline: ExclusiveEditTimeline, videos: [String: URL], orientation: VideoOrientation = .cinema, audioSource: String? = nil, videoFilter: String? = nil, showWatermark: Bool = false, pitchCents: Float = 0, kaleidoscopeType: String? = nil, kaleidoscopeSize: Float = 200, kaleidoscopeCenterX: Float = 0.5, kaleidoscopeCenterY: Float = 0.5, tileHeight: Float = 200, segmentFilterSettings: [UUID: SegmentFilterSettings] = [:], speedRate: Float = 1.0) async {
+    func export(timeline: ExclusiveEditTimeline, videos: [String: URL], orientation: VideoOrientation = .cinema, audioSource: String? = nil, videoFilter: String? = nil, showWatermark: Bool = false, pitchCents: Float = 0, kaleidoscopeType: String? = nil, kaleidoscopeSize: Float = 200, kaleidoscopeCenterX: Float = 0.5, kaleidoscopeCenterY: Float = 0.5, tileHeight: Float = 200, rotationAngle: Float = 0, segmentFilterSettings: [UUID: SegmentFilterSettings] = [:], speedRate: Float = 1.0) async {
         state = .exporting(progress: 0)
 
         do {
-            let url = try await buildAndExport(timeline: timeline, videos: videos, orientation: orientation, audioSource: audioSource, videoFilter: videoFilter, showWatermark: showWatermark, pitchCents: pitchCents, kaleidoscopeType: kaleidoscopeType, kaleidoscopeSize: kaleidoscopeSize, kaleidoscopeCenterX: kaleidoscopeCenterX, kaleidoscopeCenterY: kaleidoscopeCenterY, tileHeight: tileHeight, segmentFilterSettings: segmentFilterSettings, speedRate: speedRate)
+            let url = try await buildAndExport(timeline: timeline, videos: videos, orientation: orientation, audioSource: audioSource, videoFilter: videoFilter, showWatermark: showWatermark, pitchCents: pitchCents, kaleidoscopeType: kaleidoscopeType, kaleidoscopeSize: kaleidoscopeSize, kaleidoscopeCenterX: kaleidoscopeCenterX, kaleidoscopeCenterY: kaleidoscopeCenterY, tileHeight: tileHeight, rotationAngle: rotationAngle, segmentFilterSettings: segmentFilterSettings, speedRate: speedRate)
             // カメラロールに保存（失敗したら .done には絶対到達しない）
             do {
                 try await saveToPhotoLibrary(url: url)
@@ -94,6 +94,7 @@ final class ExportEngine: ObservableObject {
         kaleidoscopeCenterX: Float = 0.5,
         kaleidoscopeCenterY: Float = 0.5,
         tileHeight: Float = 200,
+        rotationAngle: Float = 0,
         segmentFilterSettings: [UUID: SegmentFilterSettings] = [:],
         speedRate: Float = 1.0
     ) async throws -> URL {
@@ -449,7 +450,8 @@ final class ExportEngine: ObservableObject {
                 kaleidoscopeSize: kaleidoscopeSize,
                 kaleidoscopeCenterX: kaleidoscopeCenterX,
                 kaleidoscopeCenterY: kaleidoscopeCenterY,
-                tileHeight: tileHeight
+                tileHeight: tileHeight,
+                rotationAngle: rotationAngle
             )
             filterRanges.append(FilterRange(
                 start: range.compositionStart,
@@ -478,6 +480,12 @@ final class ExportEngine: ObservableObject {
                 }
 
                 if let settings = activeSettings, !settings.isDefault {
+                    // AUTO回転: autoRotateSpeed > 0 なら時間に応じて角度を加算
+                    var angle = settings.rotationAngle
+                    if settings.autoRotateSpeed != 0 {
+                        let elapsed = Float(CMTimeGetSeconds(time))
+                        angle += settings.autoRotateSpeed * elapsed
+                    }
                     image = PlaybackController.applyFilters(
                         to: image,
                         videoFilter: settings.videoFilter,
@@ -486,7 +494,8 @@ final class ExportEngine: ObservableObject {
                         centerX: settings.kaleidoscopeCenterX,
                         centerY: settings.kaleidoscopeCenterY,
                         tileHeight: settings.tileHeight,
-                        mirrorDirection: settings.mirrorDirection
+                        mirrorDirection: settings.mirrorDirection,
+                        rotationAngle: angle
                     )
                 }
 
