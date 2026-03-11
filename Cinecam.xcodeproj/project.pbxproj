@@ -8,10 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		E2D982E22F601925007F02CE /* Lottie in Frameworks */ = {isa = PBXBuildFile; productRef = E2D982E12F601925007F02CE /* Lottie */; };
+		E2D982EE2F60CC74007F02CE /* MetalPreviewRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2D982ED2F60CC74007F02CE /* MetalPreviewRenderer.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		E28EADA92F42E8E1007131DF /* Cinecam.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cinecam.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		E2D982ED2F60CC74007F02CE /* MetalPreviewRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalPreviewRenderer.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -58,6 +60,7 @@
 				E28EADC02F42F7CD007131DF /* Docs */,
 				E28EADAB2F42E8E1007131DF /* Cinecam */,
 				E28EADAA2F42E8E1007131DF /* Products */,
+				E2D982ED2F60CC74007F02CE /* MetalPreviewRenderer.swift */,
 			);
 			sourceTree = "<group>";
 		};
@@ -148,6 +151,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				E2D982EE2F60CC74007F02CE /* MetalPreviewRenderer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

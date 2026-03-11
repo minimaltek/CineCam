@@ -102,7 +102,12 @@ final class PlaybackController: ObservableObject {
     @Published var isPlaying = false
     @Published var playheadTime: Double = 0
     /// 現在プレビューに表示すべきデバイス（セグメントがない黒画面区間では "" になることもある）
-    @Published var activePreviewDevice: String = ""
+    @Published var activePreviewDevice: String = "" {
+        didSet { metalRenderer.activeDevice = activePreviewDevice }
+    }
+
+    /// Metal ベースのプレビューレンダラー（AVPlayerItemVideoOutput → CIFilter → MTKView）
+    let metalRenderer = MetalPreviewRenderer()
 
     private(set) var players: [String: AVPlayer] = [:]
     private var playheadTimer: Timer?
@@ -141,103 +146,11 @@ final class PlaybackController: ObservableObject {
     /// フィルタパラメータホルダー（composition handler が毎フレーム snapshot() で読み取る）
     let filterParamsHolder = FilterParamsHolder()
 
-    // MARK: - Composition Management
+    // MARK: - Composition Management (Export Only)
+    // プレビューは MetalPreviewRenderer が担当。
+    // AVMutableVideoComposition は export 時のみ使用される。
 
-    /// 各デバイスに設定済みの AVMutableVideoComposition
-    private(set) var activeCompositions: [String: AVMutableVideoComposition] = [:]
-    /// composition 構築中フラグ（二重構築防止）
-    private var buildingCompositionFor: Set<String> = []
-    /// item.status の KVO 監視（readyToPlay 後に composition を構築）
-    private var readyObservations: [String: NSKeyValueObservation] = [:]
-
-    /// 指定デバイスのプレイヤーに AVMutableVideoComposition を構築して設定する。
-    /// handler 内で filterParamsHolder.snapshot() を毎フレーム読み取るため、
-    /// パラメータ変更時に再構築不要（~33ms で次フレーム反映）。
-    func buildAndApplyComposition(for device: String) {
-        guard let player = players[device],
-              let item = player.currentItem,
-              !buildingCompositionFor.contains(device) else { return }
-
-        // readyToPlay でなければ KVO で待機して、ready になったら再度呼ぶ
-        if item.status != .readyToPlay {
-            guard readyObservations[device] == nil else { return } // 既に監視中
-            let observation = item.observe(\.status, options: [.new]) { [weak self] observedItem, _ in
-                guard observedItem.status == .readyToPlay else { return }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.readyObservations.removeValue(forKey: device)
-                    self.buildAndApplyComposition(for: device)
-                }
-            }
-            readyObservations[device] = observation
-            return
-        }
-
-        buildingCompositionFor.insert(device)
-        let holder = self.filterParamsHolder
-
-        Task { @MainActor in
-            defer { buildingCompositionFor.remove(device) }
-
-            guard let asset = player.currentItem?.asset else { return }
-
-            do {
-                let composition = try await AVMutableVideoComposition.videoComposition(
-                    with: asset,
-                    applyingCIFiltersWithHandler: { [weak holder] request in
-                        guard let holder = holder else {
-                            request.finish(with: request.sourceImage, context: nil)
-                            return
-                        }
-                        let params = holder.snapshot()
-
-                        // フィルタ効果がない場合はそのまま返す（最速パス）
-                        guard params.hasEffect else {
-                            request.finish(with: request.sourceImage, context: nil)
-                            return
-                        }
-
-                        let filtered = PlaybackController.applyFilters(
-                            to: request.sourceImage,
-                            videoFilter: params.videoFilter,
-                            kaleidoscopeType: params.kaleidoscopeType,
-                            kaleidoscopeSize: params.kaleidoscopeSize,
-                            centerX: params.centerX,
-                            centerY: params.centerY,
-                            tileHeight: params.tileHeight,
-                            mirrorDirection: params.mirrorDirection,
-                            rotationAngle: params.rotationAngle
-                        )
-                        request.finish(with: filtered, context: nil)
-                    }
-                )
-
-                self.activeCompositions[device] = composition
-                player.currentItem?.videoComposition = composition
-
-            } catch {
-                print("[Composition] Failed to build for \(device): \(error)")
-                player.currentItem?.videoComposition = nil
-            }
-        }
-    }
-
-    /// 指定デバイスの composition が必要なら構築する（遅延構築用）
-    func ensureComposition(for device: String) {
-        let params = filterParamsHolder.snapshot()
-        if params.hasEffect && activeCompositions[device] == nil {
-            buildAndApplyComposition(for: device)
-        }
-    }
-
-    /// 全プレイヤーの videoComposition を除去（フィルタなし状態に戻す）
-    func removeAllCompositions() {
-        for (device, player) in players {
-            player.currentItem?.videoComposition = nil
-            activeCompositions.removeValue(forKey: device)
-        }
-        readyObservations.removeAll()
-    }
+    // (buildAndApplyComposition / ensureComposition / removeAllCompositions は Metal 移行により削除)
 
     // MARK: - Pitch Shift (AVAudioEngine)
     private var audioEngine: AVAudioEngine?
@@ -298,13 +211,14 @@ final class PlaybackController: ObservableObject {
         liveRotationAngle = newAngle
         // 一時停止中はフレームを強制更新
         if !isPlaying {
-            refreshCompositionForCurrentFrame()
+            metalRenderer.requestRender()
         }
     }
 
     func setup(videos: [String: URL]) {
         players = videos.mapValues { AVPlayer(url: $0) }
-        // composition は applyVideoFilter() 呼び出し時にオンデマンドで構築する
+        metalRenderer.filterParamsHolder = filterParamsHolder
+        metalRenderer.setup(players: players)
     }
 
     /// AVPlayer を現在の playbackRate で再生する
@@ -319,10 +233,7 @@ final class PlaybackController: ObservableObject {
         stopPitchEngine()
         stopAutoRotation()
         stopTimer()
-        // Composition のクリーンアップ
-        removeAllCompositions()
-        readyObservations.removeAll()
-        buildingCompositionFor.removeAll()
+        metalRenderer.teardown()
     }
 
     // MARK: - Pitch Engine Setup / Control
@@ -558,9 +469,9 @@ final class PlaybackController: ObservableObject {
         player.pause()
     }
 
-    // MARK: - Video Filter (AVMutableVideoComposition プレビュー)
+    // MARK: - Video Filter (Metal Preview)
 
-    /// フィルタパラメータを更新する（composition handler が次フレームで自動反映）
+    /// フィルタパラメータを更新する（Metal レンダラーが次フレームで自動反映）
     func applyVideoFilter(filterName: String?, kaleidoscopeType: String?, kaleidoscopeSize: Float, centerX: Float = 0.5, centerY: Float = 0.5, tileHeight: Float = 200, mirrorDirection: Int = 0, rotationAngle: Float = 0) {
         filterParamsHolder.update(
             videoFilter: filterName,
@@ -572,82 +483,9 @@ final class PlaybackController: ObservableObject {
             mirrorDirection: mirrorDirection,
             rotationAngle: rotationAngle
         )
-        let hasEffect = filterName != nil || kaleidoscopeType != nil
-        if hasEffect {
-            // アクティブデバイスの composition を優先構築（他は切り替え時に遅延構築）
-            if !activePreviewDevice.isEmpty {
-                ensureComposition(for: activePreviewDevice)
-            }
-            // 一時停止中でもフレームを再描画させるため seek で強制更新
-            refreshCompositionForCurrentFrame()
-        } else {
-            // フィルタなし → composition を除去して素の再生に戻す
-            removeAllCompositions()
-        }
-    }
-
-    /// フィルタパラメータ変更後にプレビューフレームを強制更新する（一時停止中のみ）。
-    /// 一時停止中は seek では composition handler が呼ばれないため、
-    /// 新しい composition オブジェクトを構築して item.videoComposition に設定する。
-    /// buildingCompositionFor ガードをバイパスし、常に最新パラメータで再構築する。
-    private var refreshGeneration: Int = 0
-    private func refreshCompositionForCurrentFrame() {
-        let device = activePreviewDevice
-        guard !device.isEmpty,
-              let player = players[device],
-              player.rate == 0,
-              let item = player.currentItem,
-              item.status == .readyToPlay else {
-            return
-        }
-
-        refreshGeneration += 1
-        let myGeneration = refreshGeneration
-        let holder = self.filterParamsHolder
-        guard let asset = item.asset as? AVAsset else { return }
-
-        Task { @MainActor in
-            // この世代より新しいリクエストが来ていたら、この構築結果は破棄
-            guard self.refreshGeneration == myGeneration else { return }
-
-            do {
-                let composition = try await AVMutableVideoComposition.videoComposition(
-                    with: asset,
-                    applyingCIFiltersWithHandler: { [weak holder] request in
-                        guard let holder = holder else {
-                            request.finish(with: request.sourceImage, context: nil)
-                            return
-                        }
-                        let params = holder.snapshot()
-
-                        guard params.hasEffect else {
-                            request.finish(with: request.sourceImage, context: nil)
-                            return
-                        }
-
-                        let filtered = PlaybackController.applyFilters(
-                            to: request.sourceImage,
-                            videoFilter: params.videoFilter,
-                            kaleidoscopeType: params.kaleidoscopeType,
-                            kaleidoscopeSize: params.kaleidoscopeSize,
-                            centerX: params.centerX,
-                            centerY: params.centerY,
-                            tileHeight: params.tileHeight,
-                            mirrorDirection: params.mirrorDirection,
-                            rotationAngle: params.rotationAngle
-                        )
-                        request.finish(with: filtered, context: nil)
-                    }
-                )
-
-                // この世代より新しいリクエストが来ていたら破棄
-                guard self.refreshGeneration == myGeneration else { return }
-
-                self.activeCompositions[device] = composition
-                item.videoComposition = composition
-            } catch {
-                print("[Refresh] Failed to rebuild composition: \(error)")
-            }
+        // 一時停止中は Metal レンダラーに強制再描画を要求
+        if !isPlaying {
+            metalRenderer.requestRender()
         }
     }
 
@@ -676,7 +514,7 @@ final class PlaybackController: ObservableObject {
             player.rate = playbackRate
         }
 
-        // filterParamsHolder を更新（composition handler が次フレームで自動読取）
+        // filterParamsHolder を更新（Metal レンダラーが次フレームで自動読取）
         filterParamsHolder.update(
             videoFilter: settings.videoFilter,
             kaleidoscopeType: settings.kaleidoscopeType,
@@ -687,11 +525,6 @@ final class PlaybackController: ObservableObject {
             mirrorDirection: settings.mirrorDirection,
             rotationAngle: settings.rotationAngle
         )
-        // フィルタ効果がある場合、composition 未構築なら構築する
-        let hasEffect = settings.videoFilter != nil || settings.kaleidoscopeType != nil
-        if hasEffect {
-            ensureComposition(for: device)
-        }
     }
 
     /// フィルタ設定変更時に呼ぶ（lastAppliedFilterSegID をリセットして再適用を強制）
@@ -1735,10 +1568,7 @@ struct PreviewView: View {
         }
         // デバイス切替時にピッチエンジンを再起動（「編集に従う」モードのみ）
         .onChange(of: playback.activePreviewDevice) { device in
-            // デバイス切替時にフィルタ composition を遅延構築
-            if !device.isEmpty {
-                playback.ensureComposition(for: device)
-            }
+            // Metal レンダラーはデバイス切替を自動検知するため追加処理不要
             guard pitchShiftCents != 0, audioSource == nil, playback.isPlaying, !device.isEmpty else { return }
             startPitchEngineIfNeeded()
         }
@@ -1788,17 +1618,9 @@ struct PreviewView: View {
                 let boxH = min(geo.size.width / previewAspectRatio,  geo.size.height)
 
                 ZStack {
-                    ForEach(sortedDevices, id: \.self) { device in
-                        if let player = playback.players[device] {
-                            FillPlayerView(
-                                player: player,
-                                isVisible: visibleDevice == device
-                            )
-                            .frame(width: boxW, height: boxH)
-                            .clipped()
-                            .opacity(visibleDevice == device ? 1 : 0)
-                        }
-                    }
+                    MetalPreviewView(renderer: playback.metalRenderer)
+                        .frame(width: boxW, height: boxH)
+                        .clipped()
 
                     // 万華鏡オーバーレイ（フィルタシート表示中 + 万華鏡選択時のみ）
                     if showFilterSheet, effectiveKaleidoscope != nil {
@@ -1913,7 +1735,7 @@ struct PreviewView: View {
     }
 
     /// 映像ピクセル座標の kaleidoscopeSize をスクリーン座標に変換する係数を計算
-    /// FillPlayerView は aspect-fill で映像を表示するため、
+    /// MetalPreviewView は aspect-fill で映像を表示するため、
     /// 映像の短辺がbox全体にフィットし、長辺ははみ出してクリップされる
     private func videoToScreenScale(boxSize: CGSize) -> CGFloat {
         // 映像解像度を推定（アスペクト比から逆算）
@@ -3962,18 +3784,30 @@ struct PreviewView: View {
         // プレイヤー初期化（PlaybackController に委譲）
         await MainActor.run { playback.setup(videos: videos) }
 
-        // duration 並列取得
+        // duration + preferredTransform 並列取得
         var durations: [String: Double] = [:]
-        await withTaskGroup(of: (String, Double).self) { group in
+        var transforms: [String: CGAffineTransform] = [:]
+        await withTaskGroup(of: (String, Double, CGAffineTransform).self) { group in
             for (device, url) in videos {
                 group.addTask {
                     let asset = AVURLAsset(url: url)
                     let dur = (try? await asset.load(.duration)).map { CMTimeGetSeconds($0) } ?? 0
-                    return (device, dur)
+                    // 動画トラックの preferredTransform を取得（天地回転の検出用）
+                    var transform = CGAffineTransform.identity
+                    if let track = try? await asset.loadTracks(withMediaType: .video).first {
+                        transform = (try? await track.load(.preferredTransform)) ?? .identity
+                    }
+                    return (device, dur, transform)
                 }
             }
-            for await (device, dur) in group { durations[device] = dur }
+            for await (device, dur, transform) in group {
+                durations[device] = dur
+                transforms[device] = transform
+            }
         }
+
+        // preferredTransform を MetalPreviewRenderer に渡す（天地回転対応）
+        await MainActor.run { playback.metalRenderer.videoTransforms = transforms }
 
         // タイムライン初期化
         await MainActor.run {
@@ -4464,34 +4298,7 @@ private struct TimelineRow: View {
 
 }
 
-// MARK: - FillPlayerView (AVPlayerLayer-based video preview)
-private class PlayerFillUIView: UIView {
-    override class var layerClass: AnyClass { AVPlayerLayer.self }
-    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
-}
-private struct FillPlayerView: UIViewRepresentable {
-    let player: AVPlayer
-    let isVisible: Bool
-
-    func makeUIView(context: Context) -> PlayerFillUIView {
-        let view = PlayerFillUIView()
-        view.playerLayer.player = player
-        view.playerLayer.videoGravity = .resizeAspectFill
-        view.backgroundColor = .black
-        return view
-    }
-
-    func updateUIView(_ uiView: PlayerFillUIView, context: Context) {
-        if uiView.playerLayer.player !== player {
-            uiView.playerLayer.player = player
-        }
-        uiView.isHidden = !isVisible
-    }
-
-    static func dismantleUIView(_ uiView: PlayerFillUIView, coordinator: ()) {
-        uiView.playerLayer.player = nil
-    }
-}
+// (FillPlayerView / PlayerFillUIView は Metal 移行により削除)
 
 // MARK: - ScrollOffsetKey
 

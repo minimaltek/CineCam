@@ -74,8 +74,7 @@ class CameraSessionManager: NSObject, ObservableObject {
     private var outgoingFailuresPerPeer: [String: Int] = [:]
     private let passiveModeThreshold: Int = 3
     
-    // 再接続リトライ用タイマー
-    private var retryWorkItems: [String: DispatchWorkItem] = [:]
+    // 再接続リトライ用カウンタ
     private let maxRetryCount = 5
     private var retryCounts: [String: Int] = [:]
     /// リトライ中フラグ（UI でリトライ中表示に使う）
@@ -309,8 +308,6 @@ class CameraSessionManager: NSObject, ObservableObject {
         persistentMasterName = nil
 
         // リトライ関連をクリア
-        retryWorkItems.values.forEach { $0.cancel() }
-        retryWorkItems.removeAll()
         retryCounts.removeAll()
         isRetrying = false
         outgoingFailuresPerPeer.removeAll()  // 完全停止時はリセット
@@ -409,19 +406,19 @@ class CameraSessionManager: NSObject, ObservableObject {
         }
         
         if !isActive {
-            scheduleRetryConnection(for: peerID)
+            retryConnectionImmediately(for: peerID)
         }
     }
     
-    /// 接続失敗時にリトライを試みる
-    /// - 最初の数回は軽量リトライ（招待フラグのクリア + 再発見待ち）
-    /// - それでもダメなら fullRestart で MCSession ごと再作成
-    private func scheduleRetryConnection(for peerID: MCPeerID) {
+    /// ★ イベント駆動リトライ: 切断イベントに即座に反応する
+    /// - peer が availablePeers にいればすぐ再招待
+    /// - いなければ何もしない（次の foundPeer イベントが自動でトリガーする）
+    /// - 連続失敗時は rebuildSession で MCPeerID を再生成
+    private func retryConnectionImmediately(for peerID: MCPeerID) {
         let peerName = peerID.displayName
         let currentCount = (retryCounts[peerName] ?? 0) + 1
         retryCounts[peerName] = currentCount
         
-        // 永続モードではリトライ上限を大幅に引き上げる
         let effectiveMaxRetry = persistentRole ? 30 : maxRetryCount
         
         guard currentCount <= effectiveMaxRetry else {
@@ -429,73 +426,58 @@ class CameraSessionManager: NSObject, ObservableObject {
             retryCounts.removeValue(forKey: peerName)
             if retryCounts.isEmpty { isRetrying = false }
             
-            // 永続モードでリトライ上限に達しても、カウンタをリセットして再試行
             if persistentRole {
-                addLog("Persistent mode – restarting retry cycle")
-                DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
-                    guard let self, self.persistentRole else { return }
-                    self.scheduleRetryConnection(for: peerID)
-                }
+                addLog("Persistent mode – resetting retry cycle")
+                retryCounts[peerName] = 0
+                // 永続モードでは discovery を再起動して foundPeer イベントを待つ
+                performLightweightRestart()
             }
             return
         }
         isRetrying = true
         
-        // 既存のリトライをキャンセル
-        retryWorkItems[peerName]?.cancel()
+        addLog("Retry \(currentCount)/\(effectiveMaxRetry)")
         
-        // ★ リトライ戦略:
-        //   1-2回目: 軽量リトライ（advertiser/browser 再起動のみ、MCPeerID維持）
-        //     → 相手からの incoming 招待がそのまま通る。MCPeerID を変えないので
-        //       相手のブラウザが即座に再発見でき、Connection refused を回避しやすい。
-        //   3回目以降: rebuildSession（MCPeerID 再生成）
-        //     → ソケットが完全に壊れている場合の最終手段。
-        //   Passive mode: MCSession 維持、advertiser/browser 再起動のみ
-        let delay: Double
-        if currentCount <= 2 {
-            delay = 3.0  // 1-2回目: 軽量リトライ（Hang 解消を待つため少し長めに）
-        } else {
-            delay = 3.0 + Double(currentCount - 2) * 2.0  // 3回目以降: 徐々に遅延を増やす
+        // 既に接続済みならスキップ
+        guard !self.connectedPeers.contains(where: { $0.displayName == peerName }) else {
+            retryCounts.removeValue(forKey: peerName)
+            if retryCounts.isEmpty { isRetrying = false }
+            return
         }
-        addLog("Retry \(currentCount)/\(effectiveMaxRetry) in \(String(format: "%.1f", delay))s")
         
-        let workItem = DispatchWorkItem { [weak self] in
+        // Passive mode: advertiser/browser のみ再起動して相手からの招待を待つ
+        let peerFailures = outgoingFailuresPerPeer[peerName] ?? 0
+        if peerFailures >= passiveModeThreshold {
+            addLog("Retry: passive restart for \(peerName) (failures=\(peerFailures))")
+            retryCounts.removeValue(forKey: peerName)
+            performLightweightRestart()
+            return
+        }
+        
+        // ★ 3回以上失敗 → rebuildSession（MCPeerID 再生成で stale ソケットを根絶）
+        if currentCount >= 3 {
+            addLog("Retry: rebuild session (count=\(currentCount))")
+            rebuildSession(preserveRole: true)
+            return
+        }
+        
+        // ★ 1-2回目: MCSession の内部ソケットクリーンアップを待ってから再招待
+        // 即座に invitePeer すると前回の接続のクリーンアップと衝突して Connection refused になる
+        invitedPeerNames.remove(peerName)
+        removeConnectingPeer(peerName)
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
+            guard !self.connectedPeers.contains(where: { $0.displayName == peerName }) else { return }
             
-            // 既に接続済みならスキップ
-            guard !self.connectedPeers.contains(where: { $0.displayName == peerName }) else {
-                self.retryCounts.removeValue(forKey: peerName)
-                if self.retryCounts.isEmpty { self.isRetrying = false }
-                return
-            }
-            
-            // ★ Passive mode: MCSession / MCPeerID はそのまま、advertiser/browser を再起動するだけ
-            // MCPeerID を再生成しないので相手側のブラウザが即座に再発見できる
-            // MCSession を nil にしないので incoming 招待を常に受け付けられる
-            let peerFailures = self.outgoingFailuresPerPeer[peerName] ?? 0
-            if peerFailures >= self.passiveModeThreshold {
-                self.addLog("Retry: passive restart for \(peerName) (failures=\(peerFailures)) – keeping session alive")
-                self.retryCounts.removeValue(forKey: peerName)
-                self.performLightweightRestart()
-                return
-            }
-            
-            // ★ 1-2回目: 軽量リトライ（MCPeerID 維持、advertiser/browser のみ再起動）
-            if currentCount <= 2 {
-                self.addLog("Retry: lightweight restart (count=\(currentCount)) – keeping PeerID")
-                self.invitedPeerNames.remove(peerName)
-                self.removeConnectingPeer(peerName)
-                self.availablePeers.removeAll { $0.displayName == peerName }
-                self.performLightweightRestart()
+            if let visiblePeer = self.availablePeers.first(where: { $0.displayName == peerName }) {
+                self.addLog("Retry: peer still visible – re-inviting")
+                self.invitedPeerNames.insert(peerName)
+                self.invitePeer(visiblePeer)
             } else {
-                // 3回目以降: rebuildSession（MCPeerID 再生成）
-                self.addLog("Retry: rebuild session (count=\(currentCount))")
-                self.rebuildSession(preserveRole: true)
+                self.addLog("Retry: peer not visible – waiting for foundPeer event")
             }
         }
-        
-        retryWorkItems[peerName] = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
     
     /// MCSession + advertiser + browser を完全に再初期化する（接続状態のみリセット、役割は維持）
@@ -512,30 +494,25 @@ class CameraSessionManager: NSObject, ObservableObject {
     private func performLightweightRestart() {
         advertiser?.stopAdvertisingPeer()
         browser?.stopBrowsingForPeers()
-        advertiser = nil
-        browser = nil
         
         // 招待状態をクリア（新しい発見サイクルで再招待できるようにする）
         invitedPeerNames.removeAll()
         clearConnectingPeers()
         availablePeers.removeAll()
         
-        // 少し待ってから再起動（古いソケットの解放を待つ）
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self else { return }
-            self.advertiser = MCNearbyServiceAdvertiser(peer: self.myPeerID,
-                                                        discoveryInfo: self.discoveryDict,
-                                                        serviceType: self.serviceType)
-            self.advertiser?.delegate = self
-            self.advertiser?.startAdvertisingPeer()
-            
-            self.browser = MCNearbyServiceBrowser(peer: self.myPeerID, serviceType: self.serviceType)
-            self.browser?.delegate = self
-            self.browser?.startBrowsingForPeers()
-            
-            self.connectionState = .connecting
-            self.addLog("Lightweight restart: advertiser/browser restarted (PeerID kept)")
-        }
+        // ★ 即座に再起動（MCPeerID/MCSession を維持するのでソケット待ち不要）
+        advertiser = MCNearbyServiceAdvertiser(peer: myPeerID,
+                                                discoveryInfo: discoveryDict,
+                                                serviceType: serviceType)
+        advertiser?.delegate = self
+        advertiser?.startAdvertisingPeer()
+        
+        browser = MCNearbyServiceBrowser(peer: myPeerID, serviceType: serviceType)
+        browser?.delegate = self
+        browser?.startBrowsingForPeers()
+        
+        connectionState = .connecting
+        addLog("Lightweight restart: advertiser/browser restarted (PeerID kept)")
     }
     
     /// リビルド中フラグ（多重実行防止）
@@ -630,8 +607,6 @@ class CameraSessionManager: NSObject, ObservableObject {
             persistentMasterName = nil
         }
 
-        retryWorkItems.values.forEach { $0.cancel() }
-        retryWorkItems.removeAll()
         if !preserveRole {
             retryCounts.removeAll()
             isRetrying = false
@@ -682,7 +657,8 @@ class CameraSessionManager: NSObject, ObservableObject {
             self.addLog("REBUILD: session rebuilt (new PeerID) – searching...")
         }
         rebuildWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
+        // ★ MCSession disconnect 後のソケットクリーンアップ待ち（安全弁）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
     }
 
     /// 切断後にDiscoveryを再開始（役割選択画面に戻る時に使用）
@@ -705,8 +681,7 @@ class CameraSessionManager: NSObject, ObservableObject {
     /// browser とリトライだけ停止
     func pauseDiscovery() {
         // リトライを全停止
-        retryWorkItems.values.forEach { $0.cancel() }
-        retryWorkItems.removeAll()
+        retryCounts.removeAll()
         isRetrying = false
 
         // browser のみ停止（advertiser は相手からの招待受付のため維持）
@@ -1798,8 +1773,6 @@ extension CameraSessionManager: MCSessionDelegate {
                 
                 // リトライカウンタをクリア
                 self.retryCounts.removeValue(forKey: peerName)
-                self.retryWorkItems[peerName]?.cancel()
-                self.retryWorkItems.removeValue(forKey: peerName)
                 if self.retryCounts.isEmpty { self.isRetrying = false }
                 
                 // マスターであれば新しく接続したピアに宣言を送る
@@ -1834,10 +1807,6 @@ extension CameraSessionManager: MCSessionDelegate {
                 guard let self else { return }
                 self.connectionState = .connecting
                 self.addLog("Connecting: \(peerName)")
-                
-                // 接続中になったらリトライをキャンセル
-                self.retryWorkItems[peerName]?.cancel()
-                self.retryWorkItems.removeValue(forKey: peerName)
             }
             
         case .notConnected:
@@ -2171,7 +2140,7 @@ extension CameraSessionManager: MCNearbyServiceBrowserDelegate {
             self.peerScores[peerName] = peerScore
             self.addLog("Found: \(peerName) (score=\(peerScore), mine=\(self.deviceScore))")
             
-            // 両方が招待を送る方式
+            // ★ イベント駆動: ピア発見 → 即座に招待判定（ディレイなし）
             let alreadyConnected = self.connectedPeers.contains(where: { $0.displayName == peerName })
             guard !alreadyConnected else { return }
             
@@ -2179,32 +2148,24 @@ extension CameraSessionManager: MCNearbyServiceBrowserDelegate {
             guard !alreadyInvited else { return }
             self.invitedPeerNames.insert(peerName)
             
-            // ★ 招待戦略: スコアが高い方が initiator（招待を送る側）
-            // スペックの高い端末のリスンソケットに接続しに行く方が Connection refused が起きにくい
-            //
-            // Passive mode: そのピアへの outgoing が連続失敗したら自分からは送らない（受け身に徹する）
+            // Passive mode: そのピアへの outgoing が連続失敗したら受け身に徹する
             let peerFailures = self.outgoingFailuresPerPeer[peerName] ?? 0
             if peerFailures >= self.passiveModeThreshold {
                 self.addLog("Passive mode: waiting for \(peerName) to invite us (failures=\(peerFailures))")
-                // ★ Passive mode でも完全に待つだけではなく、タイムアウト後に active に復帰する
-                //    相手がデバッガ Hang 中の場合、招待を送れないので永遠に待つことになる
-                //    10秒後に接続できていなければ failure counter をリセットして再試行
+                // 安全弁: 10秒後に接続できていなければ passive mode を解除
                 DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
                     guard let self else { return }
                     guard !self.connectedPeers.contains(where: { $0.displayName == peerName }) else { return }
                     if let s = self.session, s.connectedPeers.contains(where: { $0.displayName == peerName }) { return }
-                    // まだ接続できていない → passive mode を解除して active に復帰
                     self.outgoingFailuresPerPeer.removeValue(forKey: peerName)
                     self.invitedPeerNames.remove(peerName)
                     self.addLog("Passive mode timeout for \(peerName) – resetting to active mode")
-                    // advertiser/browser を再起動して再発見サイクルを開始
                     self.performLightweightRestart()
                 }
                 return
             }
             
-            // ★ スコア比較: 自分のスコアが低い場合は相手からの招待を待つ（responder）
-            // 同スコアの場合は displayName の辞書順で決定（名前が大きい方が initiator）
+            // ★ スコア比較: 高い方が initiator（招待を送る側）
             let iAmInitiator: Bool
             if self.deviceScore != peerScore {
                 iAmInitiator = self.deviceScore > peerScore
@@ -2212,35 +2173,22 @@ extension CameraSessionManager: MCNearbyServiceBrowserDelegate {
                 iAmInitiator = self.myPeerID.displayName > peerName
             }
             
-            if !iAmInitiator {
+            if iAmInitiator {
+                // ★ initiator: 即座に招待を送る（ディレイなし）
+                self.invitePeer(peerID)
+            } else {
+                // ★ responder: 相手（initiator）からの招待を待つ
+                // 安全弁: 10秒以内に招待が来なければ自分から送る
                 self.addLog("Lower score – waiting for \(peerName) to invite us")
-                // ただし、相手からの招待が来なかった場合のフォールバック
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
                     guard let self else { return }
                     guard !self.connectedPeers.contains(where: { $0.displayName == peerName }) else { return }
                     if let s = self.session, s.connectedPeers.contains(where: { $0.displayName == peerName }) { return }
+                    guard !self.isConnectingPeerFresh(peerName) else { return }
                     guard (self.outgoingFailuresPerPeer[peerName] ?? 0) < self.passiveModeThreshold else { return }
-                    self.addLog("Fallback: no invite from \(peerName) after 3s – sending our own")
+                    self.addLog("Fallback: no invite from \(peerName) after 10s – sending our own")
                     self.invitePeer(peerID)
                 }
-                return
-            }
-            
-            // リトライ中は相手がいることがわかっているが、Hang 回復を待つため少し長めに待機
-            let delay: Double = self.isRetrying
-                ? Double.random(in: 2.0...4.0)   // リトライ時: Hang 回復を待つ
-                : Double.random(in: 1.5...3.0)    // 初回: 少し待ってから送信（スコア高い側）
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self else { return }
-                guard !self.connectedPeers.contains(where: { $0.displayName == peerName }) else { return }
-                if let s = self.session, s.connectedPeers.contains(where: { $0.displayName == peerName }) { return }
-                guard !self.isConnectingPeerFresh(peerName) else {
-                    self.addLog("Skip invite: \(peerName) already CONNECTING (fresh)")
-                    return
-                }
-                self.removeConnectingPeer(peerName)
-                self.addLog("No invitation received from \(peerName) – sending our own")
-                self.invitePeer(peerID)
             }
         }
     }
@@ -2251,6 +2199,8 @@ extension CameraSessionManager: MCNearbyServiceBrowserDelegate {
             let peerName = peerID.displayName
             self.availablePeers.removeAll { $0.displayName == peerName }
             self.invitedPeerNames.remove(peerName)
+            // ★ CONNECTING 状態もクリア（次の foundPeer で即座に再招待できるようにする）
+            self.removeConnectingPeer(peerName)
             self.addLog("Peer lost: \(peerName)")
         }
     }

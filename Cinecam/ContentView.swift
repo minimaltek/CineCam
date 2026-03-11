@@ -583,22 +583,27 @@ struct ContentView: View {
                 )
                 .ignoresSafeArea()
                 
-                // クロップガイド（メイン：撮影範囲外をグレーアウト）
-                CropGuideOverlay(desiredOrientation: multiCamManager.desiredOrientation)
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-                
-                // クロップガイド（PiP小窓）
-                VStack {
-                    HStack {
-                        Spacer()
-                        CropGuideOverlay(desiredOrientation: multiCamManager.desiredOrientation)
-                            .frame(width: 120, height: 160)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .padding(.top, 60)
-                            .padding(.trailing, 16)
-                    }
-                    Spacer()
+                // クロップガイド（メイン + PiP穴あけ統合）
+                GeometryReader { geo in
+                    let isLandscape = geo.size.width > geo.size.height
+                    let pipTrailing: CGFloat = isLandscape ? 110 : 70
+                    let pipTop: CGFloat = isLandscape ? 16 : 60
+                    let pipW: CGFloat = 120
+                    let pipH: CGFloat = 160
+                    let pipX = geo.size.width - pipW - pipTrailing
+                    let pipY = pipTop
+                    let pipRect = CGRect(x: pipX, y: pipY, width: pipW, height: pipH)
+                    
+                    CropGuideOverlay(
+                        desiredOrientation: multiCamManager.desiredOrientation,
+                        pipCutout: pipRect
+                    )
+                    
+                    // クロップガイド（PiP小窓のみ）
+                    CropGuideOverlay(desiredOrientation: multiCamManager.desiredOrientation)
+                        .frame(width: pipW, height: pipH)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .position(x: pipX + pipW / 2, y: pipY + pipH / 2)
                 }
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
@@ -611,8 +616,7 @@ struct ContentView: View {
             } else {
                 // カメラ初期化中
                 VStack(spacing: 12) {
-                    ProgressView()
-                        .tint(.white)
+                    DancingLoaderView(size: 80, tint: .white.opacity(0.5))
                     Text("INITIALIZING CAMERAS...")
                         .font(.system(size: 12, weight: .semibold, design: .monospaced))
                         .tracking(2)
@@ -1134,6 +1138,8 @@ struct ContentView: View {
 /// クロップされる領域を半透明の黒帯で示すオーバーレイ
 struct CropGuideOverlay: View {
     let desiredOrientation: VideoOrientation
+    /// PiP小窓を避けるための穴あけ領域（nil = 穴なし）
+    var pipCutout: CGRect? = nil
     
     var body: some View {
         GeometryReader { geo in
@@ -1146,23 +1152,70 @@ struct CropGuideOverlay: View {
                 // ターゲットの方が横長 → 上下に黒帯
                 let cropH = w / targetRatio
                 let bar = (h - cropH) / 2
-                VStack(spacing: 0) {
-                    Rectangle().fill(Color.black.opacity(0.6)).frame(height: max(bar, 0))
-                    Spacer()
-                    Rectangle().fill(Color.black.opacity(0.6)).frame(height: max(bar, 0))
+                Canvas { ctx, size in
+                    let topRect = CGRect(x: 0, y: 0, width: size.width, height: max(bar, 0))
+                    let bottomRect = CGRect(x: 0, y: size.height - max(bar, 0), width: size.width, height: max(bar, 0))
+                    drawBarsWithCutout(ctx: &ctx, rects: [topRect, bottomRect], pip: pipCutout)
                 }
             } else if targetRatio < screenRatio - 0.05 {
                 // ターゲットの方が縦長 → 左右に黒帯
                 let cropW = h * targetRatio
                 let bar = (w - cropW) / 2
-                HStack(spacing: 0) {
-                    Rectangle().fill(Color.black.opacity(0.6)).frame(width: max(bar, 0))
-                    Spacer()
-                    Rectangle().fill(Color.black.opacity(0.6)).frame(width: max(bar, 0))
+                Canvas { ctx, size in
+                    let leftRect = CGRect(x: 0, y: 0, width: max(bar, 0), height: size.height)
+                    let rightRect = CGRect(x: size.width - max(bar, 0), y: 0, width: max(bar, 0), height: size.height)
+                    drawBarsWithCutout(ctx: &ctx, rects: [leftRect, rightRect], pip: pipCutout)
                 }
             } else {
                 // アスペクト比がほぼ一致 → ガイド不要
                 Color.clear
+            }
+        }
+    }
+
+    /// 黒帯矩形からPiP領域を差し引いた残り矩形群を返す（最大4分割）
+    private static func subtractRect(bar: CGRect, hole: CGRect) -> [CGRect] {
+        let inter = bar.intersection(hole)
+        guard !inter.isNull, inter.width > 0, inter.height > 0 else {
+            return [bar]  // 交差なし → そのまま
+        }
+        var pieces: [CGRect] = []
+        // 上の残り
+        if inter.minY > bar.minY {
+            pieces.append(CGRect(x: bar.minX, y: bar.minY,
+                                 width: bar.width, height: inter.minY - bar.minY))
+        }
+        // 下の残り
+        if inter.maxY < bar.maxY {
+            pieces.append(CGRect(x: bar.minX, y: inter.maxY,
+                                 width: bar.width, height: bar.maxY - inter.maxY))
+        }
+        // 左の残り（交差行の範囲内）
+        let midTop = max(bar.minY, inter.minY)
+        let midBot = min(bar.maxY, inter.maxY)
+        if inter.minX > bar.minX {
+            pieces.append(CGRect(x: bar.minX, y: midTop,
+                                 width: inter.minX - bar.minX, height: midBot - midTop))
+        }
+        // 右の残り（交差行の範囲内）
+        if inter.maxX < bar.maxX {
+            pieces.append(CGRect(x: inter.maxX, y: midTop,
+                                 width: bar.maxX - inter.maxX, height: midBot - midTop))
+        }
+        return pieces
+    }
+
+    /// 黒帯を描画し、PiP領域を矩形分割で穴あけする
+    private func drawBarsWithCutout(ctx: inout GraphicsContext, rects: [CGRect], pip: CGRect?) {
+        let color = Color.black.opacity(0.6)
+        for rect in rects {
+            if let pip {
+                let pieces = Self.subtractRect(bar: rect, hole: pip)
+                for piece in pieces {
+                    ctx.fill(Path(piece), with: .color(color))
+                }
+            } else {
+                ctx.fill(Path(rect), with: .color(color))
             }
         }
     }

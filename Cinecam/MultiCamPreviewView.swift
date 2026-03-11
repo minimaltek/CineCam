@@ -14,7 +14,7 @@ struct MultiCamPreviewView: UIViewRepresentable {
     let frontPreviewLayer: AVCaptureVideoPreviewLayer
     /// 現在操作中のカメラ（メイン表示になる）
     var activePosition: AVCaptureDevice.Position = .back
-    /// オリエンテーション更新用
+    /// オリエンテーション更新用 & PiPタップ切替用
     var multiCamManager: MultiCamManager
     
     func makeCoordinator() -> Coordinator {
@@ -28,6 +28,9 @@ struct MultiCamPreviewView: UIViewRepresentable {
         )
         view.backgroundColor = .black
         view.updateActivePosition(activePosition)
+        view.onPipTapped = { [weak multiCamManager] in
+            multiCamManager?.switchActiveCamera()
+        }
         
         // 端末回転の通知を監視
         NotificationCenter.default.addObserver(
@@ -85,11 +88,15 @@ class DualPreviewUIView: UIView {
     private let pipWidth: CGFloat = 120
     private let pipHeight: CGFloat = 160
     private let pipCornerRadius: CGFloat = 12
-    private let pipTopPadding: CGFloat = 60
-    private let pipTrailingPadding: CGFloat = 16
     
     // PiP border layer
     private let pipBorderLayer = CAShapeLayer()
+    
+    /// PiPタップ時のコールバック（カメラ切替）
+    var onPipTapped: (() -> Void)?
+    
+    /// 現在の PiP フレーム（タップ判定用）
+    private var currentPipFrame: CGRect = .zero
     
     init(backLayer: AVCaptureVideoPreviewLayer, frontLayer: AVCaptureVideoPreviewLayer) {
         self.backLayer = backLayer
@@ -108,10 +115,22 @@ class DualPreviewUIView: UIView {
         pipBorderLayer.strokeColor = UIColor.white.withAlphaComponent(0.4).cgColor
         pipBorderLayer.lineWidth = 1
         layer.addSublayer(pipBorderLayer)
+        
+        // PiPタップ用ジェスチャー
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        addGestureRecognizer(tap)
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+    
+    @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+        let point = gesture.location(in: self)
+        // PiP エリア内タップならカメラ切替
+        if currentPipFrame.contains(point) {
+            onPipTapped?()
+        }
     }
     
     func replaceLayers(back: AVCaptureVideoPreviewLayer, front: AVCaptureVideoPreviewLayer) {
@@ -166,13 +185,17 @@ class DualPreviewUIView: UIView {
         mainLayer.cornerRadius = 0
         mainLayer.masksToBounds = false
         
-        // PiP: top-right small window
-        let pipX = bounds.width - pipWidth - pipTrailingPadding
-        let pipY = pipTopPadding
+        // PiP: 横持ちではボタン列（カメラ切替+レンズ選択）を避けて中央寄りに配置
+        let isLandscape = bounds.width > bounds.height
+        let pipTrailing: CGFloat = isLandscape ? 110 : 70
+        let pipTop: CGFloat = isLandscape ? 16 : 60
+        let pipX = bounds.width - pipWidth - pipTrailing
+        let pipY = pipTop
         let pipFrame = CGRect(x: pipX, y: pipY, width: pipWidth, height: pipHeight)
         pipLayer.frame = pipFrame
         pipLayer.cornerRadius = pipCornerRadius
         pipLayer.masksToBounds = true
+        currentPipFrame = pipFrame
         
         // PiP border
         let borderPath = UIBezierPath(roundedRect: pipFrame, cornerRadius: pipCornerRadius)

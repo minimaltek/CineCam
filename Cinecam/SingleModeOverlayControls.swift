@@ -115,6 +115,7 @@ struct SingleModeOverlayControls: View {
                         if multiCamManager.hasTorch {
                             torchButton
                         }
+                        modeBadge
                         guideToggle
                         Spacer()
                     }
@@ -174,11 +175,9 @@ struct SingleModeOverlayControls: View {
             if multiCamManager.hasTorch {
                 torchButton
             }
+            modeBadge
             
             Spacer()
-            
-            // SINGLE MODE badge
-            modeBadge
             
             guideToggle
         }
@@ -186,16 +185,18 @@ struct SingleModeOverlayControls: View {
     
     // MARK: - Individual Controls
     
+    /// ワイプ（PiP）に映っているカメラ名を表示するバッジ
     private var modeBadge: some View {
-        HStack(spacing: 4) {
+        let pipIsBack = !isBackActive  // ワイプ = 非アクティブ側
+        return HStack(spacing: 4) {
             Circle()
-                .fill(isBackActive ? Color.orange : Color.cyan)
+                .fill(pipIsBack ? Color.orange : Color.cyan)
                 .frame(width: 6, height: 6)
-            Text(isBackActive ? "BACK" : "FRONT")
+            Text(pipIsBack ? "BACK" : "FRONT")
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .tracking(1)
         }
-        .foregroundColor(isBackActive ? .orange.opacity(0.8) : .cyan.opacity(0.8))
+        .foregroundColor(pipIsBack ? .orange.opacity(0.8) : .cyan.opacity(0.8))
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(Color.black.opacity(0.6))
